@@ -1,5 +1,6 @@
-"""Alpaca 日历提供者 + 本地 parquet 缓存。
+"""US 交易日历提供者 + 本地 parquet 缓存。
 
+首选 moomoo OpenD 的 ``request_trading_days``; 失败且配了 Alpaca 凭据时退回 Alpaca。
 首拉覆盖 [今年-1, 明年+1] 宽窗口并落盘缓存; 后续窗口命中缓存直接读,
 缓存不覆盖时才打网络。网络失败抛异常 (MarketClock 层 fail-open 处理)。
 
@@ -62,7 +63,7 @@ def _save_disk_cache(data: dict[str, object]) -> None:
         logger.warning("calendar disk cache write failed: %s", e)
 
 
-def _fetch_calendar_rows(start: date, end: date) -> list[dict]:
+def _alpaca_calendar_rows(start: date, end: date) -> list[dict]:
     key, sec, base = _secrets()
     if not key or not sec:
         raise RuntimeError("alpaca credentials not configured")
@@ -73,6 +74,56 @@ def _fetch_calendar_rows(start: date, end: date) -> list[dict]:
     })
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read())
+
+# Unknown ``trade_date_type`` values already warned about (warn once per value).
+_unknown_trade_date_types: set[str] = set()
+
+def _moomoo_calendar_rows(start: date, end: date) -> list[dict]:
+    """moomoo OpenD trading days → Alpaca-shaped rows (MORNING days close at 13:00).
+
+    Raises on every failure (OpenD down, RET_ERROR, import error, bad payload).
+    """
+    import moomoo
+
+    from app.plugins.moomoo import provider
+
+    with provider.open_ctx() as ctx:
+        ret, data = provider._unpack_ret(
+            ctx.request_trading_days(moomoo.TradeDateMarket.US, start.isoformat(), end.isoformat())
+        )
+    if ret != 0:
+        raise RuntimeError(f"moomoo request_trading_days failed: {data!r}")
+    if not isinstance(data, list):
+        raise ValueError(f"moomoo trading days payload is {type(data).__name__}, expected list")
+    rows: list[dict] = []
+    for item in data:
+        if not isinstance(item, dict) or not isinstance(item.get("time"), str):
+            raise ValueError("moomoo trading day row without time")
+        kind = str(item.get("trade_date_type") or "WHOLE").upper()
+        if kind not in ("WHOLE", "MORNING"):
+            if kind not in _unknown_trade_date_types:
+                _unknown_trade_date_types.add(kind)
+                logger.warning("unknown moomoo trade_date_type %r; treating as a full day", kind)
+            kind = "WHOLE"
+        rows.append({"date": item["time"], "close": "13:00" if kind == "MORNING" else "16:00"})
+    return rows
+
+def _fetch_calendar_rows(start: date, end: date) -> list[dict]:
+    """交易日行: moomoo 优先; 失败且配了 Alpaca 凭据时退回 Alpaca, 否则抛 moomoo 的错误。"""
+    moomoo_error: Exception | None = None
+    try:
+        return _moomoo_calendar_rows(start, end)
+    except Exception as e:
+        moomoo_error = e
+    try:
+        key, sec, _base = _secrets()
+    except Exception:
+        key = sec = ""
+    if not key or not sec:
+        assert moomoo_error is not None
+        raise moomoo_error
+    logger.warning("moomoo calendar fetch failed (%s); falling back to Alpaca", moomoo_error)
+    return _alpaca_calendar_rows(start, end)
 
 
 # early closes {"YYYY-MM-DD": "HH:MM"} (half days, e.g. day after Thanksgiving 13:00 ET); None = not loaded

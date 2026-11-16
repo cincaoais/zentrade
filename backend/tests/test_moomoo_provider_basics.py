@@ -87,3 +87,17 @@ def test_plugin_registered():
 
     assert cs.provider_has_dataset("moomoo", "daily") is True
     assert cs.provider_has_dataset("moomoo", "minute") is False
+
+def test_default_ctx_fails_fast_when_opend_down(monkeypatch):
+    """A closed OpenD port must raise within ~1 s instead of the SDK's long retry loop."""
+    import time
+
+    from app.plugins.moomoo import provider as p
+
+    monkeypatch.setenv("ZENTRADE_MOOMOO_OPEND", "127.0.0.1:1")
+    p.set_ctx_factory(None)
+    t0 = time.monotonic()
+    with pytest.raises(ConnectionError):
+        with p.open_ctx():
+            pass
+    assert time.monotonic() - t0 < 3.0

@@ -119,9 +119,25 @@ def set_ctx_factory(factory: Callable[[str, int], Any] | None) -> None:
     _CTX_FACTORY = factory
 
 
+OPEND_CONNECT_TIMEOUT_S = 1.0
+
+
+def opend_reachable(host: str, port: int, timeout: float = OPEND_CONNECT_TIMEOUT_S) -> bool:
+    """Plain TCP probe of OpenD. The SDK retries a closed port for minutes; this fails fast."""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def _default_ctx_factory(host: str, port: int) -> Any:
     import moomoo
 
+    if not opend_reachable(host, port):
+        raise ConnectionError(f"moomoo OpenD not reachable at {host}:{port}")
     return moomoo.OpenQuoteContext(host=host, port=port)
 
 
