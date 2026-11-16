@@ -186,7 +186,7 @@ plus 1 year holdout), with no slack for indicator warm-up. The stored history gr
 - The builder sets `feed`/`volume_feed` so that `quote_contract.normalize_record` (`quote_contract.py:35-76`)
   keeps snapshot volume, and documents the choice. The US quote level of the user's account was not checked,
   so `data_delay` is derived from `update_time`. *(Builder Q8.)*
-- Realtime never writes stored daily bars.
+- Realtime intraday writes to today's partition (existing quote_service behaviour) are overwritten by the post-close rotation.
 
 **Pacing and failures.**
 - A per-API sliding-window pacer inside the provider, because ZenTrade doesn't pace providers (notes/s2-r1):

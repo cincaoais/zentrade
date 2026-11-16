@@ -40,6 +40,8 @@ dependencies = [
     "pypinyin>=0.50",             # 股票名拼音首字母搜索 (同花顺式 payh → 平安银行)
     # TickFlow 官方 SDK
     "tickflow[all]>=0.1.23",
+    # moomoo OpenD 官方 SDK (内置 moomoo 数据插件)
+    "moomoo-api==10.12.7208",
     # Scheduling
     "apscheduler>=3.10",
     # Config

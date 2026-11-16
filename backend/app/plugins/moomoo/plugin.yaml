@@ -1,0 +1,10 @@
+name: moomoo
+display_name: "moomoo (OpenD)"
+runtime: none
+entry: app.plugins.moomoo.provider:MoomooProvider
+check: app.plugins.moomoo.provider:availability
+datasets: [daily, adj_factor, realtime]
+hidden: false
+description: "moomoo OpenD 本地行情：美股日K/复权事件/实时报价 (需本机运行 OpenD 并登录行情)"
+install_hint: ""
+homepage: "https://openapi.moomoo.com/moomoo-api-doc/"

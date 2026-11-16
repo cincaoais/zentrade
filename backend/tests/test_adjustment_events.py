@@ -62,6 +62,22 @@ def test_cash_dividend_detected_on_ex_date_with_price_only_factor():
     assert ev["ex_factor"] == pytest.approx(1.02, rel=1e-9)
     assert ev["vol_factor"] == 1.0
 
+def test_tiny_dividend_kept_with_fine_tick():
+    """分位舍入阈值会吞掉小额分红; 数据源精度更高时用 price_tick/min_rel 放宽到其噪声水平。
+
+    raw 180 → 181, L 由 1.00006 回到 1.0 (= $0.01 分红): 默认口径下 6e-5 的跳变
+    低于分位舍入上界 (~1.7e-4), 不产生事件; 传入 QFQ 级精度后必须恰好一条。
+    """
+    raw = _series([("2026-09-24", 180.0, 1_000_000), ("2026-09-25", 181.0, 1_000_000)])
+    adj = _series([("2026-09-24", 180.0 / 1.00006, 1_000_000), ("2026-09-25", 181.0, 1_000_000)])
+
+    assert events_from_bars(raw, adj) == []
+
+    (ev,) = events_from_bars(raw, adj, price_tick=5e-10, min_rel=1e-8)
+    assert ev["trade_date"] == date(2026, 9, 25)
+    assert ev["ex_factor"] == pytest.approx(1.00006, abs=1e-9)
+    assert ev["vol_factor"] == 1.0
+
 
 def test_events_for_symbols_accepts_alpaca_bar_stream():
     def stream(series, sym):

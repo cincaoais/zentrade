@@ -38,7 +38,7 @@ import {
   type ProviderField,
 } from '@/lib/api'
 import { QverisUsageCard } from '@/components/QverisUsageCard'
-import { SetupChecklistCard } from '@/components/SetupChecklist'
+import { SetupChecklistCard, useSetupChecklist } from '@/components/SetupChecklist'
 import { QK } from '@/lib/queryKeys'
 import { usePreferences } from '@/lib/useSharedQueries'
 import { AnchorWrap } from '@/lib/useCardFlash'
@@ -71,6 +71,7 @@ function tagCls(active: boolean, disabled = false, interactive = true) {
 
 /** 源名 → 展示名 (特殊值 + 候选/待就绪表查找, 找不到回退原始名) */
 function displayOfName(matrix: CapabilityMatrix | undefined, name: string): string {
+  if (!name) return '未配置'
   if (name === 'same_as_daily') return '跟随日K'
   for (const cap of matrix?.capabilities ?? []) {
     const hit = cap.candidates.find(c => c.name === name) ?? cap.pending.find(c => c.name === name)
@@ -98,6 +99,16 @@ function patchMatrix(
 }
 
 const DEFAULT_ROUTING: Record<ProviderField, string> = {
+  daily_data_provider: '',
+  adj_factor_provider: '',
+  minute_data_provider: '',
+  full_minute_data_provider: '',
+  realtime_data_provider: '',
+  financial_data_provider: 'sec_edgar',
+}
+
+/** Alpaca「一键套用」: 其声明了的数据集全部交给 Alpaca (与 DEFAULT_ROUTING 的未配置语义区分)。 */
+const ALPACA_ROUTING: Record<ProviderField, string> = {
   daily_data_provider: 'alpaca',
   adj_factor_provider: 'alpaca',
   minute_data_provider: 'alpaca',
@@ -548,7 +559,7 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
   const pluginList: PluginDataSourceItem[] = sources.data?.plugins ?? []
   const customList: DataSourceItem[] = sources.data?.custom ?? []
   const errors = sources.data?.errors ?? []
-  const activeName = prefs.data?.daily_data_provider || 'alpaca'
+  const activeName = prefs.data?.daily_data_provider || ''
 
   const pluginItems: DataSourceItem[] = pluginList.map(p => ({
     name: p.name, display_name: p.display_name, datasets: p.datasets,
@@ -564,15 +575,15 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
 
   // ===== 各能力当前的有效提供方 (除权 same_as_daily = 跟随日K) =====
   // 用于能力芯片"服务中"态与详情卡标识: 路由切换在上方能力路由区, 这里只读展示
-  const dailyPref = prefs.data?.daily_data_provider || 'alpaca'
+  const dailyPref = prefs.data?.daily_data_provider || ''
   const adjPref = prefs.data?.adj_factor_provider || 'same_as_daily'
   const effProvider: Record<string, string> = {
     daily: dailyPref,
     adj_factor: adjPref === 'same_as_daily' ? dailyPref : adjPref,
-    minute: prefs.data?.minute_data_provider || 'alpaca',
-    full_minute: prefs.data?.full_minute_data_provider || 'alpaca',
-    realtime: prefs.data?.realtime_data_provider || 'alpaca',
-    financial: prefs.data?.financial_data_provider || 'alpaca',
+    minute: prefs.data?.minute_data_provider || '',
+    full_minute: prefs.data?.full_minute_data_provider || '',
+    realtime: prefs.data?.realtime_data_provider || '',
+    financial: prefs.data?.financial_data_provider || 'sec_edgar',
   }
   const servingDatasets = (name: string) =>
     Object.entries(effProvider).filter(([, v]) => v === name).map(([k]) => k)
@@ -611,13 +622,13 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
     mutationFn: async (name: string) => {
       // 一键套用: 该源适配了哪些数据集就接管哪些, 其余回默认
       if (name === 'alpaca') {
-        return api.updateDataProviders(DEFAULT_ROUTING)
+        return api.updateDataProviders(ALPACA_ROUTING)
       }
       const supported = new Set(
         allItems.find(s => s.name === name)?.datasets ?? []
       )
       const pick = (dataset: string) =>
-        supported.has(dataset) ? name : DEFAULT_ROUTING[`${dataset}_data_provider` as ProviderField] ?? 'alpaca'
+        supported.has(dataset) ? name : DEFAULT_ROUTING[`${dataset}_data_provider` as ProviderField]
       return api.updateDataProviders({
         daily_data_provider: pick('daily'),
         adj_factor_provider: pick('adj_factor'),
@@ -872,6 +883,8 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
         >
           {selected === 'alpaca' ? (
             <AlpacaDetail active={servingDatasets('alpaca').length > 0} plugin={pluginList.find(x => x.name === 'alpaca')} />
+          ) : selected === 'moomoo' ? (
+            <MoomooDetail active={servingDatasets('moomoo').length > 0} plugin={pluginList.find(x => x.name === 'moomoo')} />
           ) : selected === '__new__' || customNames.has(selected) ? (
             selected === '__new__' ? (
               <DataSourceEditor
@@ -1039,6 +1052,53 @@ function PluginDetail({ plugin, isActive, matrixCaps, servingSet }: {
             })}
           </div>
         </div>
+      </div>
+    </section>
+  )
+}
+
+/** moomoo (OpenD) 详情: 只读。地址与登录状态来自配置清单接口 (不新增设置端点), 无 Key 可填。 */
+function MoomooDetail({ active, plugin }: { active: boolean; plugin?: PluginDataSourceItem }) {
+  const checklist = useSetupChecklist()
+  const item = checklist.data?.items.find(i => i.id === 'moomoo')
+  return (
+    <section className="rounded-card border border-border bg-surface p-6" data-testid="moomoo-detail">
+      <div className="flex items-start gap-4">
+        <div className="h-11 w-11 rounded-xl bg-accent/10 flex items-center justify-center shrink-0">
+          <Radio className="h-5 w-5 text-accent" />
+        </div>
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <h2 className="text-[14px] leading-6 font-semibold text-foreground">{plugin?.display_name ?? 'moomoo (OpenD)'}</h2>
+            <span className="rounded bg-warning/10 px-1 py-0.5 text-[11px] font-medium leading-none text-warning">第三方</span>
+            {active && (
+              <span className="inline-flex items-center gap-1 text-[11px] text-accent dark:text-blue-400 bg-accent/10 px-2 py-1 rounded">
+                <Check className="h-2.5 w-2.5" /> 服务中
+              </span>
+            )}
+          </div>
+          <p className="text-xs text-secondary mt-1.5 leading-relaxed">
+            本机 OpenD 提供美股日K / 复权事件 / 实时报价。无需 API Key，OpenD 自己登录行情账号。
+          </p>
+        </div>
+      </div>
+
+      <div className="mt-5 pt-5 border-t border-border space-y-3">
+        <div>
+          <div className="text-[11px] uppercase tracking-widest text-muted">OpenD 地址 / 登录状态</div>
+          <div className="mt-1 font-mono text-xs text-foreground break-all" data-testid="moomoo-opend-status">
+            {item?.note || (checklist.isLoading ? '探测中…' : '状态未知')}
+          </div>
+        </div>
+        <p className="text-[11px] text-muted">
+          在 .env 设置 ZENTRADE_MOOMOO_OPEND=host:port
+        </p>
+        {plugin && !plugin.available && (
+          <div className="flex items-center gap-1.5 text-xs text-warning">
+            <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+            <span>{plugin.status}</span>
+          </div>
+        )}
       </div>
     </section>
   )

@@ -31,17 +31,35 @@ _SPLIT_DEFAULT = 1.5   # 成交量证据不可靠时: 价格因子 <1 (合股) �
 Bar = tuple[float, float]  # (close, volume)
 
 
-def _noise_bound(raw_prev: float, level_prev: float, raw_cur: float, level_cur: float) -> float:
-    """相邻两日 L 比值的相对舍入误差上界。all = raw / L, 两者都舍入到分。"""
-    bound = _CENT * ((1 + level_prev) / raw_prev + (1 + level_cur) / raw_cur)
-    return max(bound * _SAFETY, _MIN_REL)
+def _noise_bound(
+    raw_prev: float,
+    level_prev: float,
+    raw_cur: float,
+    level_cur: float,
+    *,
+    price_tick: float = _CENT,
+    min_rel: float = _MIN_REL,
+) -> float:
+    """相邻两日 L 比值的相对舍入误差上界。all = raw / L, 两者都舍入到 price_tick。"""
+    bound = price_tick * ((1 + level_prev) / raw_prev + (1 + level_cur) / raw_cur)
+    return max(bound * _SAFETY, min_rel)
 
 
-def events_from_bars(raw: Mapping[date, Bar], adjusted: Mapping[date, Bar]) -> list[dict]:
+def events_from_bars(
+    raw: Mapping[date, Bar],
+    adjusted: Mapping[date, Bar],
+    *,
+    price_tick: float = _CENT,
+    min_rel: float = _MIN_REL,
+) -> list[dict]:
     """单个标的: {日期: (收盘, 成交量)} 两套 → 事件行 (不含 symbol)。
 
     只使用两套都有且价格为正的日期; 停牌缺口跨越时用缺口两侧的水平比较,
     事件日记在缺口后第一个有数据的交易日 (= 实际按新口径交易的首日)。
+
+    ``price_tick``/``min_rel`` 是可选的噪声底: 默认值是分位舍入的 Alpaca 口径;
+    精度更高的数据源 (9 位小数的 moomoo QFQ) 可传入更细的 tick, 以便保留
+    被分位噪声吞掉的小额分红。
     """
     if raw.keys() != adjusted.keys():
         raise ValueError("adjustment coverage mismatch: raw/all dates differ")
@@ -65,7 +83,9 @@ def events_from_bars(raw: Mapping[date, Bar], adjusted: Mapping[date, Bar]) -> l
             price_factor = prev_level / level
             # 拆合股必然改变价格口径; 只有成交量水平跳变而价格口径不变, 只能是调整后
             # 成交量取整 (累计合股后历史量被压到个位数) 的噪声, 不是公司行动。
-            price_noise = _noise_bound(prev_raw, prev_level, raw_close, level)
+            price_noise = _noise_bound(
+                prev_raw, prev_level, raw_close, level, price_tick=price_tick, min_rel=min_rel
+            )
             if abs(price_factor - 1) > price_noise:
                 events.append({
                     "trade_date": d,
@@ -101,6 +121,8 @@ def events_for_symbols(
     adjusted_bars: Iterable[tuple[str, dict]],
     *,
     skip_invalid_symbols: bool = False,
+    price_tick: float = _CENT,
+    min_rel: float = _MIN_REL,
 ) -> list[dict]:
     """Alpaca bar 流 (symbol, bar) × 2 → 全部事件行 (含 symbol)。
 
@@ -113,6 +135,8 @@ def events_for_symbols(
     隔离粒度是「单个标的」: 价格/成交量非法, 或该标的 raw/all 日期覆盖不一致,
     都只影响它自己。标的**集合**不一致 (raw 有某只、all 完全没有) 无法归属到
     具体标的, 无论开关如何都整体失败。
+
+    ``price_tick``/``min_rel`` 原样透传给 ``events_from_bars`` (默认 Alpaca 分位口径)。
     """
     def collect(stream):
         out: dict[str, dict[date, Bar]] = {}
@@ -133,7 +157,9 @@ def events_for_symbols(
     rejected: list[str] = []
     for sym in sorted(raw):
         try:
-            events = events_from_bars(raw[sym], adjusted[sym])
+            events = events_from_bars(
+                raw[sym], adjusted[sym], price_tick=price_tick, min_rel=min_rel
+            )
         except ValueError as exc:
             if not skip_invalid_symbols:
                 raise ValueError(f"{sym}: {exc}") from exc

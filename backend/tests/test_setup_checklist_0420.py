@@ -122,6 +122,10 @@ def test_checklist_never_returns_secret_values(client, store, monkeypatch):
     fake = {"alpaca": "fake-id:fake-sec", "finnhub": "fake-fh", "ai": "fake-ai"}   # 测试假值
     _secrets(store, alpaca_api_key=fake["alpaca"], finnhub_api_key=fake["finnhub"], ai_api_key=fake["ai"])
     c, _ = client
+    # 日K 路由钉在 alpaca: 未配置时 moomoo 项是 required (无 OpenD → ready=False), 与本测试无关;
+    # alpaca 在本测试环境没注册 (无 Key, getter 会回退 ""), 所以直接钉 getter 而不是 prefs。
+    from app.services import preferences
+    monkeypatch.setattr(preferences, "get_daily_data_provider", lambda: "alpaca")
     raw = c.get("/api/settings/setup-checklist").text
     for s in ("fake-id", "fake-sec", "fake-fh", "fake-ai"):
         assert s not in raw

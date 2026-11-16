@@ -98,6 +98,56 @@ def _ai_items() -> list[dict]:
     return out
 
 
+def _opend_reachable(host: str, port: int, timeout: float = 0.3) -> bool:
+    """Cheap TCP pre-check: a missing OpenD fails fast instead of the SDK's long retry loop."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def _moomoo_item(daily_provider: str) -> dict:
+    """moomoo OpenD item: live login probe (the one checklist item that connects)."""
+    from app import credentials
+    from app.plugins.moomoo import provider as moomoo_provider
+
+    try:
+        host, port = moomoo_provider.opend_address()
+        address = f"{host}:{port}"
+    except Exception:
+        # Malformed ZENTRADE_MOOMOO_OPEND: show the raw value so the user can fix it.
+        host = port = None
+        address = credentials.get(credentials.MOOMOO_OPEND).strip() or "127.0.0.1:11111"
+
+    if host is None:
+        status = {"ok": False, "qot_logined": False, "error": "ZENTRADE_MOOMOO_OPEND 格式错误"}
+    elif not _opend_reachable(host, port):
+        status = {"ok": False, "qot_logined": False, "error": f"无法连接 {address}"}
+    else:
+        try:
+            status = moomoo_provider.MoomooProvider().opend_status()
+        except Exception as e:
+            status = {"ok": False, "qot_logined": False, "error": str(e) or type(e).__name__}
+    configured = bool(status.get("ok") and status.get("qot_logined"))
+    if not status.get("ok"):
+        login = f"未连接（{status.get('error') or 'OpenD 未运行'}）"
+    else:
+        login = "行情已登录" if status.get("qot_logined") else "行情未登录"
+    # Unset routing counts as "moomoo" because moomoo replaces Alpaca as the daily source.
+    required = daily_provider in ("", "moomoo")
+    return _item(
+        "moomoo", "market", "moomoo OpenD（美股行情）", "required" if required else "optional", configured,
+        purpose="本机 OpenD 提供美股日K、复权事件与实时报价（替代 Alpaca 行情）。",
+        impact=("不配：日K、复权与实时行情不可用，机会板、回测、模拟撮合都无法运行。" if required
+                else "不配：当前日K走其它数据源，只是无法使用 moomoo 行情。"),
+        where="settings?tab=data-sources&source=moomoo&highlight=source-detail",
+        env=[credentials.MOOMOO_OPEND.env],
+        note=f"OpenD {address} · {login}",
+    )
+
+
 def build() -> dict:
     from app import credentials
     from app.services import preferences
@@ -105,13 +155,16 @@ def build() -> dict:
     items: list[dict] = []
 
     # ── 行情数据 ──
+    daily_provider = preferences.get_daily_data_provider()
     k, s, src = credentials.alpaca()
     items.append(_item(
-        "alpaca", "market", "Alpaca（美股行情）", "required", bool(k and s), source=_src_label(src),
+        "alpaca", "market", "Alpaca（美股行情）",
+        "optional" if daily_provider == "moomoo" else "required", bool(k and s), source=_src_label(src),
         purpose="SIP 历史日K / 分钟K、IEX 实时报价、NYSE 交易日历、公司行动、模拟镜像账户、Alpaca 新闻。",
         impact="不配：没有日K和交易日历，机会板、回测、模拟交易都无法运行。",
         where="settings?tab=data-sources&source=alpaca&highlight=source-detail", env=["ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY"],
         link="https://app.alpaca.markets/signup", note="免费账户即可；设置页填写格式 KEY_ID:SECRET。"))
+    items.append(_moomoo_item(daily_provider))
     tf = _plugin_status("tickflow")
     items.append(_item(
         "tickflow", "market", "TickFlow（盘中实时）", "optional", bool(tf.get("available")),

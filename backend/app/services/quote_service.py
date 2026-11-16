@@ -371,8 +371,8 @@ class QuoteService:
         return clamped
 
     def get_min_interval(self) -> float:
-        """返回当前档位允许的最小间隔。"""
-        return self._tier_min_interval()
+        """返回当前实时源允许的最小间隔。"""
+        return self._effective_min_interval()
 
     # ================================================================
     # SSE 订阅管理 — 每个 /stream 连接一个订阅者, 事件广播
@@ -453,8 +453,31 @@ class QuoteService:
         # 厂商档位限速已退役; 实时源均为插件/自定义源, 用通用下限
         return cls.CUSTOM_PROVIDER_MIN_INTERVAL
 
+    @classmethod
+    def _provider_min_interval(cls) -> float:
+        """实时源自报的最小轮询间隔 (如 moomoo 15s); 未配置/不可用 → 0。
+
+        OpenD 的行情快照有厂商限速, 用户偏好再快也不能低于插件声明值。
+        """
+        try:
+            from app.services import preferences
+
+            provider_name = preferences.get_realtime_data_provider()
+            if not provider_name:
+                return 0.0
+            from app.data_providers import custom as custom_sources
+
+            provider = custom_sources.get_provider(provider_name)
+            value = getattr(provider, "min_realtime_interval_seconds", 0.0)
+            return max(0.0, float(value or 0.0))
+        except Exception:  # 源缺失/未加载不应阻塞行情服务
+            return 0.0
+
+    def _effective_min_interval(self) -> float:
+        return max(self._tier_min_interval(), self._provider_min_interval())
+
     def _clamp_interval(self, interval: float) -> float:
-        return max(self._tier_min_interval(), min(self.MAX_INTERVAL, interval))
+        return max(self._effective_min_interval(), min(self.MAX_INTERVAL, interval))
 
     # ================================================================
     # 行情数据访问
@@ -592,7 +615,9 @@ class QuoteService:
                 logger.warning("行情轮询异常: %s", e)
 
             waited = 0.0
-            while self._running and self._enabled and waited < self._interval:
+            # 运行中切换实时源 (如改到 moomoo) 时, 下限按当前源即时生效, 不等重启
+            wait_for = max(self._interval, self._provider_min_interval())
+            while self._running and self._enabled and waited < wait_for:
                 time.sleep(0.5)
                 waited += 0.5
 

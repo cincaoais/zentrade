@@ -30,6 +30,7 @@ FINNHUB = SecretSpec("FINNHUB_API_KEY", "finnhub_api_key", "finnhub.env")
 MASSIVE = SecretSpec("MASSIVE_API_KEY", "massive_api_key", "polygon.env")
 POLYGON = SecretSpec("POLYGON_API_KEY", "", "polygon.env")
 SEC_UA = SecretSpec("SEC_USER_AGENT", "sec_user_agent")
+MOOMOO_OPEND = SecretSpec("ZENTRADE_MOOMOO_OPEND", "moomoo_opend")
 
 
 def _from_env_dir(spec: SecretSpec) -> str:
