@@ -58,6 +58,7 @@ const PRESETS: AiPreset[] = [
   { label: '自定义', url: '', model: '', website: '', websiteLabel: '', description: '手动填写 API 地址、模型和密钥', custom: true },
   { label: 'OpenAI', provider: OPENAI_PROVIDER, url: 'https://api.openai.com/v1', model: DEFAULT_OPENAI_MODEL, website: 'https://platform.openai.com/', websiteLabel: 'platform.openai.com', description: 'OpenAI 官方接口 · 可配置推理强度' },
   { label: 'DeepSeek', url: 'https://api.deepseek.com', model: 'deepseek-v4-pro', website: 'https://www.deepseek.com/', websiteLabel: 'deepseek.com', description: 'DeepSeek 官方接口（OpenAI 兼容）' },
+  { label: 'Surplus Intelligence', url: 'https://api.surplusintelligence.ai/v1', model: 'deepseek-v4.1-flash', website: 'https://www.surplusintelligence.ai/', websiteLabel: 'surplusintelligence.ai', description: 'Surplus Intelligence 聚合接口（OpenAI 兼容）· 模型见 /v1/models' },
   { label: '通义千问', url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-3.6plus', website: 'https://tongyi.aliyun.com/', websiteLabel: 'tongyi.aliyun.com', description: '阿里云 DashScope 接口（OpenAI 兼容）' },
   { label: '智谱 GLM', url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-5.2', website: 'https://open.bigmodel.cn/', websiteLabel: 'open.bigmodel.cn', description: '智谱 AI 官方接口（OpenAI 兼容）' },
   { label: 'Kimi', url: 'https://api.moonshot.cn/v1', model: 'kimi-k2.7-code', website: 'https://platform.moonshot.cn/', websiteLabel: 'platform.moonshot.cn', description: 'Moonshot 官方接口（OpenAI 兼容）· 支持长上下文' },
