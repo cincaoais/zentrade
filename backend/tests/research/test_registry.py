@@ -24,6 +24,7 @@ def _pins(**overrides: object) -> Pins:
         "wyckoff_version": "wyk-1",
         "table_hashes": {"A": "tA", "B": "tB"},
         "bridge_hash": "bridge-1",
+        "variant_configs": {},
     }
     values.update(overrides)
     return Pins(**values)  # type: ignore[arg-type]
@@ -103,6 +104,48 @@ def test_n_trials_counts_dev_variants_and_holdout_reruns(tmp_path):
         )
 
     assert registry.n_trials() == 4
+
+
+def test_record_stores_config(tmp_path):
+    registry = Registry(tmp_path / "registry.json")
+    config = {"base": "A", "rank": "rs", "slots": 5}
+
+    registry.record(
+        variant_id="A",
+        period="dev",
+        table_hash="table-A",
+        code_hash="code-1",
+        sharpe_daily=0.5,
+        n_obs=500,
+        config=config,
+    )
+    registry.record(
+        variant_id="B",
+        period="dev",
+        table_hash="table-B",
+        code_hash="code-1",
+        sharpe_daily=0.5,
+        n_obs=500,
+    )
+
+    rows = registry.rows()
+    assert rows[0]["config"] == config
+    assert rows[1]["config"] is None
+
+
+def test_pin_variant_configs_checked(tmp_path):
+    frozen_pins = _pins(
+        variant_configs={"A": {"base": "A", "rank": "hash", "slots": 10}}
+    )
+    _, _, out, _ = _frozen(tmp_path, ["A"], frozen_pins)
+
+    with pytest.raises(HoldoutLocked) as exc:
+        check_holdout_allowed(
+            out,
+            _pins(variant_configs={"A": {"base": "A", "rank": "hash", "slots": 5}}),
+            "A",
+        )
+    assert "variant_configs" in str(exc.value)
 
 
 def test_registry_write_atomic(tmp_path):

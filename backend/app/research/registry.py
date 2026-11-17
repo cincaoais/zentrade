@@ -12,7 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
@@ -26,6 +26,7 @@ _PIN_FIELDS = (
     "wyckoff_version",
     "table_hashes",
     "bridge_hash",
+    "variant_configs",
 )
 
 
@@ -74,6 +75,7 @@ class Pins:
     wyckoff_version: str
     table_hashes: dict[str, str]
     bridge_hash: str
+    variant_configs: dict[str, dict] = field(default_factory=dict)
 
 
 class Registry:
@@ -96,6 +98,7 @@ class Registry:
         code_hash: str,
         sharpe_daily: float | None,
         n_obs: int,
+        config: dict | None = None,
     ) -> None:
         if period not in _PERIODS:
             raise ValueError(f"unknown period {period!r}")
@@ -108,6 +111,7 @@ class Registry:
                 "code_hash": code_hash,
                 "sharpe_daily": sharpe_daily,
                 "n_obs": n_obs,
+                "config": config,
                 "run_at": _now_iso(),
             }
         )
@@ -194,9 +198,11 @@ def check_holdout_allowed(
 
     frozen_pins = payload.get("pins") or {}
     current_pins = asdict(current)
-    for field in _PIN_FIELDS:
-        if frozen_pins.get(field) != current_pins.get(field):
-            raise HoldoutLocked(f"holdout locked: pin {field} differs from freeze")
+    for pin_field in _PIN_FIELDS:
+        if frozen_pins.get(pin_field) != current_pins.get(pin_field):
+            raise HoldoutLocked(
+                f"holdout locked: pin {pin_field} differs from freeze"
+            )
 
     if variant_id not in (payload.get("variants") or []):
         raise HoldoutLocked(

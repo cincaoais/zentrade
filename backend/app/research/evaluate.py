@@ -8,6 +8,8 @@ use exactly the same path, so every comparison shares costs and execution.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 from collections.abc import Callable
@@ -20,8 +22,8 @@ import numpy as np
 import polars as pl
 
 from app.backtest.strategy import StrategyBacktestConfig, StrategyBacktestResult
-from app.research import DEV_END, HOLDOUT_END, HOLDOUT_START
-from app.research.baselines import b0_bh, random_signals
+from app.research import DEV_END, HOLDOUT_END, HOLDOUT_START, baselines, compose
+from app.research.baselines import b0_bh, invalidation_k, random_signals
 from app.research.compose import compose_table
 from app.research.metrics import curve_stats, dsr, summarize
 from app.research.registry import Registry
@@ -92,8 +94,13 @@ def folds(
     trading_days: list[date],
     test_len: int = 126,
     embargo: int = 5,
+    min_tail: int = 63,
 ) -> list[Period]:
-    """Consecutive test windows inside ``period``, each after a 5-bar embargo."""
+    """Consecutive test windows inside ``period``, each after a 5-bar embargo.
+
+    Days left over after the last full window (and its embargo) become one final
+    window when there are at least ``min_tail`` of them.
+    """
     days = sorted({d for d in trading_days if period.start <= d <= period.end})
     result: list[Period] = []
     start = 0
@@ -101,6 +108,9 @@ def folds(
         window = days[start : start + test_len]
         result.append(Period(period.name, window[0], window[-1]))
         start += test_len + embargo
+    tail = days[start:]
+    if len(tail) >= min_tail:
+        result.append(Period(period.name, tail[0], tail[-1]))
     return result
 
 
@@ -114,6 +124,7 @@ def run_table(
     table_path: Path,
     period: Period,
     slippage_bps: float = MAIN_SLIPPAGE_BPS,
+    max_positions: int = 10,
 ) -> StrategyBacktestResult:
     """Run one composed table over ``period`` through the normal backtest service."""
     config = StrategyBacktestConfig(
@@ -122,7 +133,7 @@ def run_table(
         start=period.start,
         end=period.end,
         params={"table_path": str(table_path)},
-        max_positions=10,
+        max_positions=max_positions,
         position_sizing="equal",
         entry_fill="open_t+1",
         exit_fill="open_t+1",
@@ -300,14 +311,68 @@ class EvalContext:
     var_sr_trials: float = 0.0
     trading_days: list[date] | None = None
     bh_cagr: float | None = None
-    # Called with (random table paths, period) and returns CAGRs. The CLI wires
-    # a process pool here; tests leave it None and use the monkeypatched run_table.
-    random_runner: Callable[[list[Path], Period], list[float]] | None = None
+    configs: dict[str, dict] = field(default_factory=dict)
+    random_cache_dir: Path | None = None
+    cache_salt: str = ""
+    random_cache: dict[str, list[float]] = field(default_factory=dict, repr=False)
+    # Called with (random table paths, period, max_positions) and returns CAGRs.
+    # The CLI wires a process pool here; tests use the monkeypatched run_table.
+    random_runner: Callable[[list[Path], Period, int], list[float]] | None = None
 
 
 def _write_table(path: Path, table: pl.DataFrame) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     table.write_parquet(path, compression="zstd", statistics=False)
+
+
+def _iso_date(value: object) -> str:
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()[:10]
+    return str(value)[:10]
+
+
+def _random_cache_key(
+    ctx: EvalContext,
+    table: pl.DataFrame,
+    period: Period,
+    seeds: int,
+    slots: int,
+) -> str:
+    """Content key for the random baseline: entries, invalidation, slots, code."""
+    counts = table.filter(pl.col("entry")).group_by("date").len().sort("date")
+    payload = {
+        "counts": [[_iso_date(d), int(n)] for d, n in counts.iter_rows()],
+        "k": repr(invalidation_k(table)),
+        "slots": int(slots),
+        "period": [period.name, period.start.isoformat(), period.end.isoformat()],
+        "seeds": int(seeds),
+        "code": [
+            file_hash(Path(baselines.__file__)),
+            file_hash(Path(compose.__file__)),
+            file_hash(Path(__file__)),
+        ],
+        "salt": ctx.cache_salt,
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _read_random_cache(path: Path) -> tuple[list[float], str | None] | None:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return [float(value) for value in payload["cagrs"]], payload.get("note")
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def _write_random_cache(path: Path, cagrs: list[float]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps({"cagrs": cagrs, "note": None}, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _random_cagrs(
@@ -316,32 +381,51 @@ def _random_cagrs(
     table: pl.DataFrame,
     period: Period,
     seeds: int,
-) -> tuple[list[float], str | None]:
-    """Random-entry CAGRs, or a note when the variant has no entries."""
+    slots: int,
+) -> tuple[list[float], str | None, bool]:
+    """Random-entry CAGRs, a note when the variant has no entries, and cache hit."""
     if seeds <= 0:
-        return [], None
+        return [], None, False
     if ctx.bars.is_empty() or ctx.elig.is_empty():
-        return [], "no inputs"
+        return [], "no inputs", False
+
+    key = _random_cache_key(ctx, table, period, seeds, slots)
+    cached = ctx.random_cache.get(key)
+    if cached is not None:
+        return list(cached), None, True
+    cache_path = None
+    if ctx.random_cache_dir is not None:
+        cache_path = Path(ctx.random_cache_dir) / f"{key}.json"
+        stored = _read_random_cache(cache_path)
+        if stored is not None:
+            cagrs, note = stored
+            if note is None:
+                ctx.random_cache[key] = list(cagrs)
+            return cagrs, note, True
 
     base = ctx.work_dir or (Path(ctx.data_dir) / "research" / "tmp")
     paths: list[Path] = []
     for seed in range(seeds):
         signals = random_signals(table, ctx.elig, ctx.bars, seed)
         if signals is None:
-            return [], "no entries"
+            return [], "no entries", False
         random_table, _log = compose_table(signals, ctx.bars, ctx.elig)
         path = base / f"{variant_id}-{period.name}-random-{seed}.parquet"
         _write_table(path, random_table)
         paths.append(path)
 
     if ctx.random_runner is not None:
-        return [float(value) for value in ctx.random_runner(paths, period)], None
+        cagrs = [float(value) for value in ctx.random_runner(paths, period, slots)]
+    else:
+        cagrs = []
+        for path in paths:
+            result = run_table(ctx.svc, path, period, max_positions=slots)
+            cagrs.append(float(curve_stats(equity_frame(result))["cagr"]))
 
-    cagrs: list[float] = []
-    for path in paths:
-        result = run_table(ctx.svc, path, period)
-        cagrs.append(float(curve_stats(equity_frame(result))["cagr"]))
-    return cagrs, None
+    ctx.random_cache[key] = list(cagrs)
+    if cache_path is not None:
+        _write_random_cache(cache_path, cagrs)
+    return cagrs, None, False
 
 
 def evaluate_variant(
@@ -356,10 +440,20 @@ def evaluate_variant(
     table_path = Path(ctx.tables[variant_id])
     table = pl.read_parquet(table_path)
 
-    main_result = run_table(ctx.svc, table_path, period, MAIN_SLIPPAGE_BPS)
+    config = dict(ctx.configs[variant_id]) if variant_id in ctx.configs else {}
+    config.setdefault("base", variant_id)
+    config.setdefault("rank", "hash")
+    config.setdefault("slots", 10)
+    slots = int(config["slots"])
+
+    main_result = run_table(
+        ctx.svc, table_path, period, MAIN_SLIPPAGE_BPS, max_positions=slots
+    )
     main_metrics, main_equity = _metrics(main_result, table, ctx)
 
-    stress_result = run_table(ctx.svc, table_path, period, STRESS_SLIPPAGE_BPS)
+    stress_result = run_table(
+        ctx.svc, table_path, period, STRESS_SLIPPAGE_BPS, max_positions=slots
+    )
     stress_metrics, _stress_equity = _metrics(stress_result, table, ctx)
 
     fold_results: list[dict] = []
@@ -368,7 +462,7 @@ def evaluate_variant(
         if days is None:
             days = table["date"].unique().sort().to_list()
         for fold in folds(period, list(days)):
-            result = run_table(ctx.svc, table_path, fold)
+            result = run_table(ctx.svc, table_path, fold, max_positions=slots)
             metrics, _equity = _metrics(result, table, ctx)
             fold_results.append(
                 {
@@ -378,7 +472,9 @@ def evaluate_variant(
                 }
             )
 
-    random_cagrs, random_note = _random_cagrs(ctx, variant_id, table, period, seeds)
+    random_cagrs, random_note, random_cache_hit = _random_cagrs(
+        ctx, variant_id, table, period, seeds, slots
+    )
     random_percentile = None
     if random_cagrs:
         cagr = float(main_metrics["cagr"])
@@ -399,6 +495,8 @@ def evaluate_variant(
         "random_cagrs": random_cagrs,
         "random_percentile": random_percentile,
         "random_note": random_note,
+        "random_cache_hit": random_cache_hit,
+        "config": config,
         "gate": None,
     }
 
@@ -418,6 +516,7 @@ def evaluate_variant(
         code_hash=file_hash(Path(__file__)),
         sharpe_daily=float(curve_stats(main_equity)["sharpe_daily"]),
         n_obs=int(main_equity.height),
+        config=config,
     )
     return result
 

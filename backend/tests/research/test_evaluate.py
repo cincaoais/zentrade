@@ -25,6 +25,46 @@ def _elig(rows: list[tuple[date, int]]) -> pl.DataFrame:
     )
 
 
+def _entry_table(path, entries: list[tuple[str, date]]) -> pl.DataFrame:
+    frame = pl.DataFrame(
+        {
+            "symbol": [symbol for symbol, _d in entries],
+            "date": [d for _symbol, d in entries],
+            "entry": [True for _ in entries],
+            "exit": [False for _ in entries],
+            "score": [1.0 for _ in entries],
+            "invalidation": [99.0 for _ in entries],
+            "atr14": [2.0 for _ in entries],
+            "close": [100.0 for _ in entries],
+        },
+        schema_overrides={
+            "date": pl.Date,
+            "entry": pl.Boolean,
+            "exit": pl.Boolean,
+        },
+    )
+    frame.write_parquet(path)
+    return frame
+
+
+def _random_bars(days: list[date]) -> pl.DataFrame:
+    rows: list[dict] = []
+    for d in days:
+        for symbol in ("AAA", "BBB", "CCC"):
+            rows.append(
+                {
+                    "symbol": symbol,
+                    "date": d,
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.0,
+                    "atr14": 2.0,
+                }
+            )
+    return pl.DataFrame(rows, schema_overrides={"date": pl.Date})
+
+
 def _table(path) -> pl.DataFrame:
     frame = pl.DataFrame(
         {
@@ -99,6 +139,21 @@ def test_folds_embargo() -> None:
         assert fold.end <= period.end
 
 
+def test_folds_tail_window() -> None:
+    days = [date(2024, 1, 1) + timedelta(days=i) for i in range(499)]
+    period = ev.Period("dev", days[0], days[-1])
+
+    result = ev.folds(period, days, test_len=126, embargo=5)
+
+    assert len(result) == 4
+    assert result[3].start == days[393]
+    assert result[3].end == days[498]
+
+    short = days[:433]
+    short_period = ev.Period("dev", short[0], short[-1])
+    assert len(ev.folds(short_period, short, test_len=126, embargo=5)) == 3
+
+
 # ---------------------------------------------------------------------------
 # Engine result adaptation and run_table wiring
 # ---------------------------------------------------------------------------
@@ -147,6 +202,24 @@ def test_run_table_config(tmp_path) -> None:
     assert config.exit_fill == "open_t+1"
     assert config.slippage_bps == 15.0
     assert config.mode == "position"
+
+
+def test_run_table_passes_max_positions(tmp_path) -> None:
+    seen: list = []
+
+    class _Svc:
+        def run(self, config):
+            seen.append(config)
+            return "result"
+
+    path = tmp_path / "table.parquet"
+    period = ev.Period("dev", date(2024, 1, 2), date(2024, 3, 1))
+
+    ev.run_table(_Svc(), path, period, max_positions=5)
+    ev.run_table(_Svc(), path, period)
+
+    assert seen[0].max_positions == 5
+    assert seen[1].max_positions == 10
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +282,7 @@ def test_evaluate_records_registry_row(tmp_path, monkeypatch) -> None:
     registry = Registry(tmp_path / "registry.json")
     period = ev.Period("dev", date(2024, 1, 2), date(2024, 3, 1))
 
-    def fake_run_table(svc, path, period, slippage_bps=5.0):
+    def fake_run_table(svc, path, period, slippage_bps=5.0, max_positions=10):
         return _fake_result(period.start, period.end)
 
     monkeypatch.setattr(ev, "run_table", fake_run_table)
@@ -232,6 +305,170 @@ def test_evaluate_records_registry_row(tmp_path, monkeypatch) -> None:
     assert rows[0]["variant_id"] == "H1-2B"
     assert rows[0]["period"] == "dev"
     assert rows[0]["table_hash"] == table_path.stem
+
+
+def test_slots_reach_every_run(tmp_path) -> None:
+    table_path = tmp_path / "V.parquet"
+    other_path = tmp_path / "W.parquet"
+    _table(table_path)
+    _table(other_path)
+    registry = Registry(tmp_path / "registry.json")
+    days = [date(2024, 1, 2) + timedelta(days=i) for i in range(300)]
+    period = ev.Period("dev", days[0], days[-1])
+    seen: list = []
+
+    class _Svc:
+        def run(self, config):
+            seen.append(config)
+            return _fake_result(config.start, config.end)
+
+    ctx = ev.EvalContext(
+        svc=_Svc(),
+        registry=registry,
+        data_dir=tmp_path,
+        tables={"V": table_path, "W": other_path},
+        bars=_random_bars([days[0], days[1]]),
+        elig=_elig([(days[0], 3), (days[1], 3)]),
+        work_dir=tmp_path / "tmp",
+        trading_days=days,
+        configs={"V": {"base": "V", "rank": "rs", "slots": 20}},
+    )
+
+    result = ev.evaluate_variant(ctx, "V", period, seeds=2)
+
+    assert result["config"] == {"base": "V", "rank": "rs", "slots": 20}
+    assert len(seen) == 2 + len(ev.folds(period, days)) + 2
+    assert all(config.max_positions == 20 for config in seen)
+
+    seen.clear()
+    result = ev.evaluate_variant(ctx, "W", period, seeds=2)
+
+    assert result["config"] == {"base": "W", "rank": "hash", "slots": 10}
+    assert all(config.max_positions == 10 for config in seen)
+
+
+def test_random_cache_hit_same_entries(tmp_path) -> None:
+    day = date(2024, 1, 2)
+    first_path = tmp_path / "A.parquet"
+    frame = _entry_table(first_path, [("AAA", day)])
+    second_path = tmp_path / "B.parquet"
+    frame.with_columns(pl.lit(0.9).alias("score")).write_parquet(second_path)
+    registry = Registry(tmp_path / "registry.json")
+    period = ev.Period("dev", day, date(2024, 3, 1))
+    cache_dir = tmp_path / "random-cache"
+
+    class _Svc:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def run(self, config):
+            self.calls += 1
+            return _fake_result(config.start, config.end)
+
+    svc = _Svc()
+
+    def make_ctx() -> ev.EvalContext:
+        return ev.EvalContext(
+            svc=svc,
+            registry=registry,
+            data_dir=tmp_path,
+            tables={"A": first_path, "B": second_path},
+            bars=_random_bars([day, date(2024, 1, 3)]),
+            elig=_elig([(day, 3), (date(2024, 1, 3), 3)]),
+            work_dir=tmp_path / "tmp",
+            trading_days=[],
+            random_cache_dir=cache_dir,
+        )
+
+    first = ev.evaluate_variant(make_ctx(), "A", period, seeds=2)
+    calls_after_first = svc.calls
+    second = ev.evaluate_variant(make_ctx(), "B", period, seeds=2)
+
+    assert first["random_cache_hit"] is False
+    assert second["random_cache_hit"] is True
+    assert svc.calls - calls_after_first == 2
+    assert second["random_cagrs"] == first["random_cagrs"]
+    assert list(cache_dir.glob("*.json"))
+
+    fresh = ev.evaluate_variant(make_ctx(), "A", period, seeds=2)
+    assert fresh["random_cache_hit"] is True
+    assert fresh["random_cagrs"] == first["random_cagrs"]
+
+
+def test_random_cache_misses_on_slots_or_counts(tmp_path) -> None:
+    day = date(2024, 1, 2)
+    base_path = tmp_path / "base.parquet"
+    extra_path = tmp_path / "extra.parquet"
+    _entry_table(base_path, [("AAA", day)])
+    _entry_table(extra_path, [("AAA", day), ("BBB", day)])
+    period = ev.Period("dev", day, date(2024, 3, 1))
+    cache_dir = tmp_path / "random-cache"
+
+    class _Svc:
+        def run(self, config):
+            return _fake_result(config.start, config.end)
+
+    def make_ctx(table_path, slots: int, salt: str = "") -> ev.EvalContext:
+        return ev.EvalContext(
+            svc=_Svc(),
+            registry=Registry(tmp_path / f"registry-{slots}-{salt}.json"),
+            data_dir=tmp_path,
+            tables={"A": table_path},
+            bars=_random_bars([day, date(2024, 1, 3)]),
+            elig=_elig([(day, 3), (date(2024, 1, 3), 3)]),
+            work_dir=tmp_path / "tmp",
+            trading_days=[],
+            configs={"A": {"base": "A", "rank": "hash", "slots": slots}},
+            random_cache_dir=cache_dir,
+            cache_salt=salt,
+        )
+
+    first = ev.evaluate_variant(make_ctx(base_path, 5), "A", period, seeds=2)
+    assert first["random_cache_hit"] is False
+    assert first["random_cagrs"]
+
+    slots_miss = ev.evaluate_variant(make_ctx(base_path, 10), "A", period, seeds=2)
+    assert slots_miss["random_cache_hit"] is False
+
+    counts_miss = ev.evaluate_variant(make_ctx(extra_path, 10), "A", period, seeds=2)
+    assert counts_miss["random_cache_hit"] is False
+
+    salt_miss = ev.evaluate_variant(make_ctx(base_path, 10, salt="x"), "A", period, seeds=2)
+    assert salt_miss["random_cache_hit"] is False
+
+
+def test_random_runner_receives_slots(tmp_path) -> None:
+    day = date(2024, 1, 2)
+    table_path = tmp_path / "V.parquet"
+    _table(table_path)
+    period = ev.Period("dev", day, date(2024, 3, 1))
+    calls: list[int] = []
+
+    def runner(paths, period, max_positions):
+        calls.append(max_positions)
+        return [0.1 for _ in paths]
+
+    class _Svc:
+        def run(self, config):
+            return _fake_result(config.start, config.end)
+
+    ctx = ev.EvalContext(
+        svc=_Svc(),
+        registry=Registry(tmp_path / "registry.json"),
+        data_dir=tmp_path,
+        tables={"V": table_path},
+        bars=_random_bars([day, date(2024, 1, 3)]),
+        elig=_elig([(day, 3), (date(2024, 1, 3), 3)]),
+        work_dir=tmp_path / "tmp",
+        trading_days=[],
+        configs={"V": {"base": "V", "rank": "rs", "slots": 7}},
+        random_runner=runner,
+    )
+
+    result = ev.evaluate_variant(ctx, "V", period, seeds=2)
+
+    assert calls == [7]
+    assert result["random_cagrs"] == [0.1, 0.1]
 
 
 # ---------------------------------------------------------------------------
