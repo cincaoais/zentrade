@@ -101,15 +101,23 @@ def compose_table(
     for frame in (signals.entries, signals.sells, bars, elig):
         assert_no_future_columns(frame)
 
+    has_raw_score = "raw_score" in signals.entries.columns
+
     # 2. Merge several signals for the same (symbol, date); highest invalidation
-    # wins because it is the tighter stop.
+    # wins because it is the tighter stop. A ranked signal also merges its
+    # raw score with ``max`` (null only when every signal for the row is null).
+    merged_columns = ["symbol", "date", "invalidation", "source"]
+    merged_aggs = [
+        pl.col("invalidation").max().alias("invalidation"),
+        pl.col("source").sort().first().alias("source"),
+    ]
+    if has_raw_score:
+        merged_columns.append("raw_score")
+        merged_aggs.append(pl.col("raw_score").max().alias("raw_score"))
     merged = (
-        signals.entries.select("symbol", "date", "invalidation", "source")
+        signals.entries.select(merged_columns)
         .group_by(["symbol", "date"])
-        .agg(
-            pl.col("invalidation").max().alias("invalidation"),
-            pl.col("source").sort().first().alias("source"),
-        )
+        .agg(*merged_aggs)
     )
     emitted = merged.height
 
@@ -155,12 +163,15 @@ def compose_table(
         }
 
     grid = _with_atr(grid)
-    kept_marker = kept.select(
+    kept_columns = [
         "symbol",
         "date",
         pl.col("invalidation").alias("entry_invalidation"),
         pl.lit(True).alias("entry"),
-    )
+    ]
+    if has_raw_score:
+        kept_columns.insert(2, "raw_score")
+    kept_marker = kept.select(*kept_columns)
     grid = grid.join(kept_marker, on=["symbol", "date"], how="left").with_columns(
         pl.col("entry").fill_null(False),
         pl.col("entry_invalidation")
@@ -183,18 +194,21 @@ def compose_table(
         (pl.col("_stop_exit") | pl.col("_sell")).alias("exit")
     )
 
-    # 7. Keep only signal rows, attach the neutral score, sort by (date, symbol).
-    table = (
+    # 7. Keep only signal rows, attach the score, sort by (date, symbol).
+    row_columns = [
+        "symbol",
+        "date",
+        "entry",
+        "exit",
+        pl.col("active_invalidation").alias("invalidation"),
+        "atr14",
+        "close",
+    ]
+    if has_raw_score:
+        row_columns.append("raw_score")
+    rows = (
         grid.filter(pl.col("entry") | pl.col("exit"))
-        .select(
-            "symbol",
-            "date",
-            "entry",
-            "exit",
-            pl.col("active_invalidation").alias("invalidation"),
-            "atr14",
-            "close",
-        )
+        .select(row_columns)
         .with_columns(
             pl.struct(["symbol", "date", "entry"])
             .map_elements(
@@ -205,9 +219,38 @@ def compose_table(
             )
             .alias("score")
         )
-        .select(list(TABLE_COLUMNS))
-        .sort(["date", "symbol"])
     )
+
+    if has_raw_score:
+        # Exact small integers per decision date: the bridge casts to float32
+        # and orders descending, so best = n, worst = 1 over the kept entries.
+        ranked = (
+            rows.filter(pl.col("entry"))
+            .with_columns(pl.col("raw_score").is_null().alias("_raw_is_null"))
+            .sort(
+                ["date", "_raw_is_null", "raw_score", "score"],
+                descending=[False, False, True, True],
+            )
+            .with_columns(
+                (
+                    pl.len().over("date")
+                    + 1
+                    - pl.col("symbol").cum_count().over("date")
+                )
+                .cast(pl.Float64)
+                .alias("score")
+            )
+            .select("symbol", "date", "score")
+        )
+        rows = (
+            rows.select(
+                "symbol", "date", "entry", "exit", "invalidation", "atr14", "close"
+            )
+            .join(ranked, on=["symbol", "date"], how="left")
+            .with_columns(pl.col("score").fill_null(0.0))
+        )
+
+    table = rows.select(list(TABLE_COLUMNS)).sort(["date", "symbol"])
 
     log = {
         "emitted": emitted,

@@ -62,6 +62,27 @@ def _entries(rows: list[tuple[str, int, float, str]]) -> pl.DataFrame:
     )
 
 
+def _scored_entries(
+    rows: list[tuple[str, int, float, float | None]],
+) -> pl.DataFrame:
+    return pl.DataFrame(
+        {
+            "symbol": [r[0] for r in rows],
+            "date": [DATES[r[1]] for r in rows],
+            "invalidation": [r[2] for r in rows],
+            "source": ["ranked"] * len(rows),
+            "raw_score": [r[3] for r in rows],
+        },
+        schema={
+            "symbol": pl.String,
+            "date": pl.Date,
+            "invalidation": pl.Float64,
+            "source": pl.String,
+            "raw_score": pl.Float64,
+        },
+    )
+
+
 def _sells(rows: list[tuple[str, int]]) -> pl.DataFrame:
     return pl.DataFrame(
         {"symbol": [r[0] for r in rows], "date": [DATES[r[1]] for r in rows]},
@@ -225,3 +246,131 @@ def test_precomputed_atr_gives_identical_table() -> None:
     fast, fast_log = compose_table(signals, with_atr14(bars), _elig(["AAA"]))
     assert plain.equals(fast)
     assert plain_log == fast_log
+
+
+def test_raw_score_orders_entries_per_date() -> None:
+    symbols = ["AAA", "BBB", "CCC", "DDD"]
+    signals = Signals(
+        entries=_scored_entries(
+            [
+                ("AAA", 2, 50.0, 0.3),
+                ("BBB", 2, 50.0, None),
+                ("CCC", 2, 50.0, 0.9),
+                ("DDD", 2, 50.0, 0.1),
+            ]
+        ),
+        sells=_sells([]),
+    )
+    bars = pl.concat([_bars(symbol) for symbol in symbols])
+    table, _ = compose_table(signals, bars, _elig(symbols))
+    scores = {
+        row["symbol"]: row["score"]
+        for row in table.filter(pl.col("entry")).to_dicts()
+    }
+    assert scores == {"AAA": 3.0, "BBB": 1.0, "CCC": 4.0, "DDD": 2.0}
+
+
+def test_raw_score_ties_use_hash() -> None:
+    symbols = ["AAA", "BBB"]
+    signals = Signals(
+        entries=_scored_entries(
+            [("AAA", 2, 50.0, 0.5), ("BBB", 2, 50.0, 0.5)]
+        ),
+        sells=_sells([]),
+    )
+    bars = pl.concat([_bars(symbol) for symbol in symbols])
+    table, _ = compose_table(signals, bars, _elig(symbols))
+    scores = {
+        row["symbol"]: row["score"]
+        for row in table.filter(pl.col("entry")).to_dicts()
+    }
+
+    hashes = {s: entry_score(s, DATES[2]) for s in symbols}
+    best = max(symbols, key=hashes.__getitem__)
+    worst = min(symbols, key=hashes.__getitem__)
+    assert scores[best] == 2.0
+    assert scores[worst] == 1.0
+    assert len(set(scores.values())) == 2
+
+
+def test_raw_score_ranks_are_per_date() -> None:
+    symbols = ["AAA", "BBB", "CCC"]
+    signals = Signals(
+        entries=_scored_entries(
+            [
+                ("AAA", 1, 50.0, 0.2),
+                ("BBB", 1, 50.0, 0.9),
+                ("CCC", 1, 50.0, 0.5),
+                ("BBB", 5, 50.0, 0.1),
+                ("CCC", 5, 50.0, 0.8),
+            ]
+        ),
+        sells=_sells([]),
+    )
+    bars = pl.concat([_bars(symbol) for symbol in symbols])
+    table, _ = compose_table(signals, bars, _elig(symbols))
+    entries = table.filter(pl.col("entry")).to_dicts()
+    day1 = {r["symbol"]: r["score"] for r in entries if r["date"] == DATES[1]}
+    day5 = {r["symbol"]: r["score"] for r in entries if r["date"] == DATES[5]}
+    assert day1 == {"AAA": 1.0, "BBB": 3.0, "CCC": 2.0}
+    assert day5 == {"BBB": 1.0, "CCC": 2.0}
+
+
+def test_raw_score_merge_takes_max() -> None:
+    symbols = ["AAA", "BBB"]
+    signals = Signals(
+        entries=_scored_entries(
+            [
+                ("AAA", 2, 50.0, 0.2),
+                ("AAA", 2, 55.0, 0.7),
+                ("BBB", 2, 50.0, 0.5),
+            ]
+        ),
+        sells=_sells([]),
+    )
+    bars = pl.concat([_bars(symbol) for symbol in symbols])
+    table, log = compose_table(signals, bars, _elig(symbols))
+
+    assert log["emitted"] == 2
+    aaa = table.filter(pl.col("symbol") == "AAA").to_dicts()
+    assert len(aaa) == 1
+    assert aaa[0]["invalidation"] == 55.0
+    scores = {
+        row["symbol"]: row["score"]
+        for row in table.filter(pl.col("entry")).to_dicts()
+    }
+    assert scores == {"AAA": 2.0, "BBB": 1.0}
+
+
+def test_without_raw_score_unchanged() -> None:
+    signals = Signals(
+        entries=_entries(
+            [("AAA", 1, 50.0, "x"), ("BBB", 1, 50.0, "x"), ("CCC", 4, 50.0, "x")]
+        ),
+        sells=_sells([("AAA", 6)]),
+    )
+    symbols = ["AAA", "BBB", "CCC"]
+    bars = pl.concat([_bars(symbol) for symbol in symbols])
+    table, _ = compose_table(signals, bars, _elig(symbols))
+    entry_rows = table.filter(pl.col("entry")).to_dicts()
+    assert entry_rows
+    for row in entry_rows:
+        assert row["score"] == entry_score(row["symbol"], row["date"])
+    assert table.filter(pl.col("exit")).height == 1
+    exit_rows = table.filter(pl.col("exit")).to_dicts()
+    assert all(row["score"] == 0.0 for row in exit_rows)
+
+
+def test_scores_survive_float32() -> None:
+    symbols = [f"S{i:03d}" for i in range(300)]
+    signals = Signals(
+        entries=_scored_entries(
+            [(symbol, 2, 50.0, i / 300.0) for i, symbol in enumerate(symbols)]
+        ),
+        sells=_sells([]),
+    )
+    bars = pl.concat([_bars(symbol) for symbol in symbols])
+    table, _ = compose_table(signals, bars, _elig(symbols))
+    scores32 = table.select(pl.col("score").cast(pl.Float32))["score"]
+    assert table.filter(pl.col("entry")).height == 300
+    assert scores32.n_unique() == 300
