@@ -221,6 +221,7 @@ def _h3_variant(chan_type: str, source: str) -> Callable[[Inputs], Signals]:
             bar_pos, on=["symbol", "date"], how="left"
         )
 
+        # wyk TradingRange.active_at: known_at <= i <= end_idx (the ending bar counts as active).
         ranges = (
             inputs.wyk_ranges.filter(pl.col("range_kind").is_in(ACC_KINDS))
             .select(
@@ -235,7 +236,7 @@ def _h3_variant(chan_type: str, source: str) -> Callable[[Inputs], Signals]:
             .join(ranges, on="symbol", how="inner")
             .filter(
                 (pl.col("_range_known") <= pl.col("date"))
-                & (pl.col("end_date").is_null() | (pl.col("date") < pl.col("end_date")))
+                & (pl.col("end_date").is_null() | (pl.col("date") <= pl.col("end_date")))
             )
             .select("_entry_id")
             .unique()

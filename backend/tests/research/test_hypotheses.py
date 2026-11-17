@@ -224,10 +224,14 @@ def test_h3_requires_active_acc_range_and_recent_event() -> None:
     assert signals.entries["date"].to_list() == [DATES[30]]
     assert signals.entries["invalidation"].to_list() == [90.0]
 
-    # A range that closes at t is no longer active at t.
+    # wyk active_at: the range's ending bar still counts as active; the bar after does not.
     ended_at_t = _wyk_ranges([{"range_kind": "accumulation", "known": 0, "end": 30}])
     assert VARIANTS["H3-2B"](
         _inputs(chan_points=points, wyk_events=events, wyk_ranges=ended_at_t)
+    ).entries["date"].to_list() == [DATES[30]]
+    ended_before_t = _wyk_ranges([{"range_kind": "accumulation", "known": 0, "end": 29}])
+    assert VARIANTS["H3-2B"](
+        _inputs(chan_points=points, wyk_events=events, wyk_ranges=ended_before_t)
     ).entries.is_empty()
 
     # The event must be within the last 20 bars up to and including t.
