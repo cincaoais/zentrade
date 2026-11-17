@@ -7,12 +7,22 @@ day at a time and records only what was knowable on that day.
 
 from __future__ import annotations
 
+import logging
+import multiprocessing
+import os
+import time
 from collections.abc import Callable
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 import pandas as pd
 import polars as pl
+
+logger = logging.getLogger(__name__)
+
+# The engine only ever sees these columns; everything else is store metadata.
+ENGINE_COLUMNS = ("date", "open", "high", "low", "close", "volume", "amount")
 
 POINT_COLUMNS = (
     "symbol",
@@ -219,3 +229,185 @@ def replay_symbol(
         _frame(gone_rows, GONE_COLUMNS, _GONE_SCHEMA),
         stats,
     )
+
+
+# ---------------------------------------------------------------------------
+# Runner: parts, resume, worker pool
+# ---------------------------------------------------------------------------
+
+
+def chan_dir(data_dir: Path) -> Path:
+    """``<data_dir>/research/chan/<chan_engine_version>``."""
+    from app.research.versions import chan_engine_version
+
+    return Path(data_dir) / "research" / "chan" / chan_engine_version()
+
+
+def _real_snapshot(frame: pd.DataFrame) -> dict:
+    """The real daily engine, as a module-level (picklable) callable."""
+    from app.research.vendor.dsa_chan.engine import build_level_snapshot
+
+    return build_level_snapshot(frame, "1d")
+
+
+def _write_pair(
+    points: pl.DataFrame,
+    points_path: Path,
+    gone: pl.DataFrame,
+    gone_path: Path,
+) -> None:
+    """Write both parts through ``.tmp`` files; the points part lands last.
+
+    The points file is the resume marker, so it must never exist while its
+    sibling is missing. Fixed parquet settings keep the bytes reproducible.
+    """
+    points_path.parent.mkdir(parents=True, exist_ok=True)
+    gone_path.parent.mkdir(parents=True, exist_ok=True)
+    points_tmp = points_path.with_name(points_path.name + ".tmp")
+    gone_tmp = gone_path.with_name(gone_path.name + ".tmp")
+    try:
+        gone.write_parquet(gone_tmp, compression="zstd", statistics=False)
+        points.write_parquet(points_tmp, compression="zstd", statistics=False)
+        os.replace(gone_tmp, gone_path)
+        os.replace(points_tmp, points_path)
+    finally:
+        for tmp in (points_tmp, gone_tmp):
+            if tmp.exists():
+                tmp.unlink()
+
+
+def _replay_one(task: tuple[str, str, Callable[[pd.DataFrame], dict] | None, str]) -> dict:
+    """Replay one symbol in a child process; never raises."""
+    data_dir_s, symbol, snapshot_fn, engine_version = task
+    try:
+        from app.research.bars import load_bars
+
+        bars = load_bars(Path(data_dir_s), symbols=[symbol])
+        frame = bars.to_pandas()
+        missing = [column for column in ENGINE_COLUMNS if column not in frame.columns]
+        if missing:
+            raise ValueError(f"bars frame is missing columns: {', '.join(missing)}")
+        frame = frame.loc[:, list(ENGINE_COLUMNS)]
+
+        points, gone, stats = replay_symbol(
+            symbol,
+            frame,
+            snapshot_fn if snapshot_fn is not None else _real_snapshot,
+            engine_version,
+        )
+        base = Path(data_dir_s) / "research" / "chan" / engine_version
+        _write_pair(
+            points,
+            base / "points" / f"{symbol}.parquet",
+            gone,
+            base / "gone" / f"{symbol}.parquet",
+        )
+    except Exception as exc:
+        logger.exception("chan replay failed for %s", symbol)
+        return {
+            "symbol": symbol,
+            "ok": False,
+            "error_days": 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+    return {"symbol": symbol, "ok": True, "error_days": stats["error_days"], "error": None}
+
+
+def run_chan_replay(
+    data_dir: Path,
+    symbols: list[str],
+    workers: int,
+    snapshot_fn: Callable[[pd.DataFrame], dict] | None = None,
+) -> dict:
+    """Replay ``symbols`` into parquet parts, resuming where parts exist.
+
+    ``snapshot_fn=None`` uses the real engine at timeframe ``"1d"``. Each part
+    is written atomically, one process per symbol; a symbol that raises is
+    logged and reported in ``failed`` without leaving a part behind.
+    """
+    from app.research.versions import chan_engine_version
+
+    data_dir = Path(data_dir)
+    engine_version = chan_engine_version()
+    base = data_dir / "research" / "chan" / engine_version
+    points_dir = base / "points"
+    points_dir.mkdir(parents=True, exist_ok=True)
+    (base / "gone").mkdir(parents=True, exist_ok=True)
+
+    todo: list[str] = []
+    skipped = 0
+    for symbol in symbols:
+        if (points_dir / f"{symbol}.parquet").exists():
+            skipped += 1
+        else:
+            todo.append(symbol)
+
+    result: dict = {
+        "done": 0,
+        "skipped_existing": skipped,
+        "failed": [],
+        "error_days": 0,
+    }
+    if not todo:
+        return result
+
+    tasks = [(str(data_dir), symbol, snapshot_fn, engine_version) for symbol in todo]
+    total = len(tasks)
+    workers = max(1, int(workers))
+    started = time.monotonic()
+    completed = 0
+
+    def merge(outcome: dict) -> None:
+        nonlocal completed
+        completed += 1
+        if outcome["ok"]:
+            result["done"] += 1
+            result["error_days"] += outcome["error_days"]
+        else:
+            result["failed"].append(outcome["symbol"])
+        if completed % 50 == 0 and completed < total:
+            elapsed = time.monotonic() - started
+            eta = elapsed / completed * (total - completed)
+            logger.info(
+                "chan replay %d/%d symbols, %.0fs elapsed, ETA %.0fs",
+                completed,
+                total,
+                elapsed,
+                eta,
+            )
+
+    if workers == 1:
+        for outcome in map(_replay_one, tasks):
+            merge(outcome)
+    else:
+        context = multiprocessing.get_context("spawn")
+        with context.Pool(processes=workers) as pool:
+            for outcome in pool.imap_unordered(_replay_one, tasks, chunksize=1):
+                merge(outcome)
+
+    result["failed"].sort()
+    logger.info(
+        "chan replay finished: %d done, %d skipped, %d failed",
+        result["done"],
+        result["skipped_existing"],
+        len(result["failed"]),
+    )
+    return result
+
+
+def load_chan_points(data_dir: Path) -> pl.DataFrame:
+    """Concatenate every ``points/<SYMBOL>.parquet`` part."""
+    base = chan_dir(data_dir) / "points"
+    files = sorted(base.glob("*.parquet")) if base.is_dir() else []
+    if not files:
+        return pl.DataFrame(schema={column: _POINT_SCHEMA[column] for column in POINT_COLUMNS})
+    return pl.concat([pl.read_parquet(path) for path in files], how="vertical")
+
+
+def load_chan_gone(data_dir: Path) -> pl.DataFrame:
+    """Concatenate every ``gone/<SYMBOL>.parquet`` part."""
+    base = chan_dir(data_dir) / "gone"
+    files = sorted(base.glob("*.parquet")) if base.is_dir() else []
+    if not files:
+        return pl.DataFrame(schema={column: _GONE_SCHEMA[column] for column in GONE_COLUMNS})
+    return pl.concat([pl.read_parquet(path) for path in files], how="vertical")
