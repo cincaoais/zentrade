@@ -260,3 +260,21 @@ def test_empty_result_has_typed_columns():
     assert points.schema["confirmed_date"] == pl.Date
     assert gone.schema["gone_date"] == pl.Date
     assert stats == {"days": 21, "available_days": 21, "error_days": 0}
+
+def test_gone_rows_on_same_day_are_sorted():
+    """Points vanishing on the same day come out in (type, point_dt) order.
+
+    Set iteration order of string tuples varies with PYTHONHASHSEED, so an
+    unsorted loop made the stored gone parts differ byte-for-byte between runs.
+    """
+    vanishing = [
+        _point(type=point_type, dt=f"2024-05-{day:02d}")
+        for point_type in ("3S", "3B", "2S", "2B", "1S", "1B")
+        for day in (9, 3)
+    ]
+    mapping = {130: _snap(points=vanishing), 131: _snap()}
+    _, gone, _ = replay_symbol("AAA", _bars(140), _scripted(mapping), "engine-v1")
+
+    keys = list(zip(gone["type"].to_list(), gone["point_dt"].to_list(), strict=True))
+    assert len(keys) == 12
+    assert keys == sorted(keys)

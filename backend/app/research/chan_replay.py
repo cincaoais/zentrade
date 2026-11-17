@@ -209,7 +209,10 @@ def replay_symbol(
                 row["confirmed_date"] = current_date
 
         window_start = _earliest_start(recent_bis)
-        for identity in previous_ids - current_ids:
+        # Sorted: set order of string tuples varies with PYTHONHASHSEED, which
+        # made stored gone parts differ byte-for-byte between runs.
+        vanished = sorted(previous_ids - current_ids, key=lambda key: (str(key[0]), str(key[1])))
+        for identity in vanished:
             row = seen[identity]
             gone_rows.append(
                 {

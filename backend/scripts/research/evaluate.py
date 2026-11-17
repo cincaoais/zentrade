@@ -331,9 +331,27 @@ def main(argv: list[str] | None = None) -> int:
 
     # Integrity first: a leak found after hours of backtests would waste them all.
     eligible_symbols = elig.filter(pl.col("eligible"))["symbol"].unique().to_list()
+    logger.info("integrity checks (Chan truncation replays the real engine; ~30 min)")
     integrity = _integrity(data_dir, eligible_symbols, args.workers)
+    integrity_path = research_dir / f"integrity-{args.period}.json"
+    integrity_path.parent.mkdir(parents=True, exist_ok=True)
+    integrity_path.write_text(json.dumps(integrity, indent=1, default=str), encoding="utf-8")
+    logger.info(
+        "integrity: chan %d cuts / %d mismatches, wyckoff %d cuts / %d mismatches, "
+        "determinism %d identical / %d different -> %s",
+        integrity["chan_truncation"].get("checked", 0),
+        len(integrity["chan_truncation"].get("mismatches") or []),
+        integrity["wyckoff_truncation"].get("checked", 0),
+        len(integrity["wyckoff_truncation"].get("mismatches") or []),
+        integrity["determinism"].get("identical", 0),
+        len(integrity["determinism"].get("different") or []),
+        integrity_path,
+    )
     if _integrity_failed(integrity):
-        print("evaluate: integrity check failed; aborting", file=sys.stderr)
+        print(
+            f"evaluate: integrity check failed; aborting (details: {integrity_path})",
+            file=sys.stderr,
+        )
         return 1
 
     svc = _build_service(data_dir)
