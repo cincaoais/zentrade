@@ -42,6 +42,8 @@ dependencies = [
     "tickflow[all]>=0.1.23",
     # moomoo OpenD 官方 SDK (内置 moomoo 数据插件)
     "moomoo-api==10.12.7208",
+    # 缠论研究 harness (app/research 专用; 实盘路径不得引用)
+    "czsc==1.0.2",
     # Scheduling
     "apscheduler>=3.10",
     # Config
