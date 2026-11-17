@@ -1,16 +1,24 @@
-"""The 18 research hypotheses: entry/invalidation/sell rules per variant."""
+"""The 71 research hypotheses: entry/invalidation/sell rules per variant."""
 
 from __future__ import annotations
 
 from datetime import date, timedelta
 
 import polars as pl
+import pytest
 
-from app.research.hypotheses import VARIANTS, Inputs, variant_path
+from app.research.hypotheses import (
+    VARIANT_CONFIGS,
+    VARIANTS,
+    Inputs,
+    VariantConfig,
+    variant_config,
+    variant_path,
+)
 
 DATES = [date(2024, 1, 1) + timedelta(days=i) for i in range(300)]
 
-VARIANTS_EXPECTED = {
+V1_VARIANT_IDS = [
     "H1-2B",
     "H1-3B",
     "H1-1B",
@@ -22,14 +30,81 @@ VARIANTS_EXPECTED = {
     "H4-3B",
     "H5-w5",
     "H5-w10",
+    "H1c-2B",
+    "H1c-3B",
     "H6-H3-2B",
     "H6-H3-3B",
     "H6-H4-3B",
     "H6-H5-w5",
     "H6-H5-w10",
-    "H1c-2B",
-    "H1c-3B",
-}
+]
+
+GROUP_A_BASES = ("H1c-2B", "H1-2B", "H1c-3B", "H1-3B", "H1-1B")
+GROUP_A_RANKS = ("rs", "retr", "risk", "relvol", "lowvol")
+GROUP_B_BASES = ("H5-w10", "H2-sos")
+GROUP_B_RANKS = ("rs", "risk", "relvol", "lowvol")
+GROUP_C_BASES = ("H1c-2B", "H1-2B")
+GROUP_C_RANKS = ("rs", "retr", "risk", "relvol", "lowvol")
+
+VARIANT_IDS_EXPECTED = [
+    *V1_VARIANT_IDS,
+    # Group A: five Chan bases, five ranks, 10 slots.
+    "H1c-2B~rs",
+    "H1c-2B~retr",
+    "H1c-2B~risk",
+    "H1c-2B~relvol",
+    "H1c-2B~lowvol",
+    "H1-2B~rs",
+    "H1-2B~retr",
+    "H1-2B~risk",
+    "H1-2B~relvol",
+    "H1-2B~lowvol",
+    "H1c-3B~rs",
+    "H1c-3B~retr",
+    "H1c-3B~risk",
+    "H1c-3B~relvol",
+    "H1c-3B~lowvol",
+    "H1-3B~rs",
+    "H1-3B~retr",
+    "H1-3B~risk",
+    "H1-3B~relvol",
+    "H1-3B~lowvol",
+    "H1-1B~rs",
+    "H1-1B~retr",
+    "H1-1B~risk",
+    "H1-1B~relvol",
+    "H1-1B~lowvol",
+    # Group B: two bases, four ranks, 10 slots (no retr).
+    "H5-w10~rs",
+    "H5-w10~risk",
+    "H5-w10~relvol",
+    "H5-w10~lowvol",
+    "H2-sos~rs",
+    "H2-sos~risk",
+    "H2-sos~relvol",
+    "H2-sos~lowvol",
+    # Group C: two bases, five ranks, 5 then 20 slots.
+    "H1c-2B~rs~p5",
+    "H1c-2B~rs~p20",
+    "H1c-2B~retr~p5",
+    "H1c-2B~retr~p20",
+    "H1c-2B~risk~p5",
+    "H1c-2B~risk~p20",
+    "H1c-2B~relvol~p5",
+    "H1c-2B~relvol~p20",
+    "H1c-2B~lowvol~p5",
+    "H1c-2B~lowvol~p20",
+    "H1-2B~rs~p5",
+    "H1-2B~rs~p20",
+    "H1-2B~retr~p5",
+    "H1-2B~retr~p20",
+    "H1-2B~risk~p5",
+    "H1-2B~risk~p20",
+    "H1-2B~relvol~p5",
+    "H1-2B~relvol~p20",
+    "H1-2B~lowvol~p5",
+    "H1-2B~lowvol~p20",
+]
 
 _POINT_SCHEMA = {
     "symbol": pl.String,
@@ -141,6 +216,7 @@ def _inputs(
     wyk_ranges: pl.DataFrame | None = None,
     bars: pl.DataFrame | None = None,
     spy: pl.DataFrame | None = None,
+    features: pl.DataFrame | None = None,
 ) -> Inputs:
     empty_points = pl.DataFrame(schema=_POINT_SCHEMA)
     empty_events = pl.DataFrame(schema=_EVENT_SCHEMA)
@@ -151,6 +227,7 @@ def _inputs(
         wyk_ranges=wyk_ranges if wyk_ranges is not None else empty_ranges,
         bars=bars if bars is not None else _bars(n=300),
         spy=spy if spy is not None else _spy([100.0] * 300),
+        features=features,
     )
 
 
@@ -339,9 +416,157 @@ def test_h6_spy_regime() -> None:
     assert long_signals.entries["date"].to_list() == [DATES[240]]
 
 
+def test_variant_configs_grid() -> None:
+    assert len(VARIANT_CONFIGS) == 71
+    assert list(VARIANT_CONFIGS) == VARIANT_IDS_EXPECTED
+    assert list(VARIANT_CONFIGS)[: len(V1_VARIANT_IDS)] == V1_VARIANT_IDS
+    for variant_id in V1_VARIANT_IDS:
+        assert VARIANT_CONFIGS[variant_id] == VariantConfig(variant_id, "hash", 10)
+
+    expected: dict[str, VariantConfig] = {}
+    for base in GROUP_A_BASES:
+        for rank in GROUP_A_RANKS:
+            expected[f"{base}~{rank}"] = VariantConfig(base, rank, 10)
+    for base in GROUP_B_BASES:
+        for rank in GROUP_B_RANKS:
+            expected[f"{base}~{rank}"] = VariantConfig(base, rank, 10)
+    for base in GROUP_C_BASES:
+        for rank in GROUP_C_RANKS:
+            for slots in (5, 20):
+                expected[f"{base}~{rank}~p{slots}"] = VariantConfig(
+                    base, rank, slots
+                )
+
+    assert len(expected) == 53
+    assert list(expected) == VARIANT_IDS_EXPECTED[len(V1_VARIANT_IDS) :]
+    for variant_id, config in expected.items():
+        assert VARIANT_CONFIGS[variant_id] == config
+
+    for variant_id in VARIANT_CONFIGS:
+        if variant_id.startswith(("H5-w10", "H2-sos")):
+            assert VARIANT_CONFIGS[variant_id].rank != "retr"
+
+
 def test_variant_ids_exact() -> None:
-    assert len(VARIANTS) == 18
-    assert set(VARIANTS) == VARIANTS_EXPECTED
+    assert len(VARIANTS) == 71
+    assert list(VARIANTS) == list(VARIANT_CONFIGS)
+    assert list(VARIANTS) == VARIANT_IDS_EXPECTED
+
+
+def test_ranked_variant_same_entries_as_base() -> None:
+    points = _chan_points(
+        [
+            {
+                "day": 0,
+                "type": "2B",
+                "confirmed": 5,
+                "leg_prev_start": 0,
+                "leg_prev_end": 1,
+                "leg_last_start": 2,
+                "leg_last_end": 3,
+            },
+            {
+                "day": 1,
+                "type": "2B",
+                "confirmed": 8,
+                "leg_prev_start": 2,
+                "leg_prev_end": 3,
+                "leg_last_start": 4,
+                "leg_last_end": 5,
+            },
+        ]
+    )
+    inputs = _inputs(chan_points=points)
+    base = VARIANTS["H1c-2B"](inputs)
+    assert base.entries.height == 2
+
+    for rank in ("rs", "retr", "risk", "relvol", "lowvol"):
+        ranked = VARIANTS[f"H1c-2B~{rank}"](inputs)
+        assert "raw_score" in ranked.entries.columns
+        assert ranked.entries["raw_score"].dtype == pl.Float64
+        assert ranked.entries.drop("raw_score").equals(base.entries)
+        assert ranked.sells.equals(base.sells)
+
+
+def test_ranked_variant_uses_precomputed_features() -> None:
+    points = _chan_points(
+        [
+            {
+                "day": 0,
+                "type": "2B",
+                "confirmed": 5,
+                "leg_prev_start": 0,
+                "leg_prev_end": 1,
+                "leg_last_start": 2,
+                "leg_last_end": 3,
+            }
+        ]
+    )
+    features = pl.DataFrame(
+        {
+            "symbol": ["AAA"],
+            "date": [DATES[5]],
+            "close": [100.0],
+            "atr14": [1.0],
+            "rs63": [42.5],
+            "relvol": [1.0],
+            "atrp": [0.01],
+        },
+        schema={
+            "symbol": pl.String,
+            "date": pl.Date,
+            "close": pl.Float64,
+            "atr14": pl.Float64,
+            "rs63": pl.Float64,
+            "relvol": pl.Float64,
+            "atrp": pl.Float64,
+        },
+    )
+    signals = VARIANTS["H1c-2B~rs"](
+        _inputs(chan_points=points, features=features)
+    )
+
+    assert signals.entries["raw_score"].to_list() == [42.5]
+
+
+def test_retr_uses_base_date_column() -> None:
+    points = _chan_points(
+        [
+            {
+                "day": 1,
+                "type": "2B",
+                "confirmed": 5,
+                "leg_prev_start": 0,
+                "leg_prev_end": 0,
+                "leg_last_start": 1,
+                "leg_last_end": 1,
+            },
+            {
+                "day": 1,
+                "type": "3B",
+                "confirmed": 5,
+                "leg_prev_start": 0,
+                "leg_prev_end": 1,
+                "leg_last_start": 2,
+                "leg_last_end": 3,
+            },
+        ]
+    )
+    inputs = _inputs(chan_points=points)
+
+    confirmed = VARIANTS["H1c-2B~retr"](inputs)
+    known = VARIANTS["H1-2B~retr"](inputs)
+
+    assert confirmed.entries["date"].to_list() == [DATES[5]]
+    assert known.entries["date"].to_list() == [DATES[1]]
+    assert confirmed.entries["raw_score"].to_list() == [-1.0]
+    assert known.entries["raw_score"].to_list() == [-1.0]
+
+
+def test_variant_config_lookup() -> None:
+    assert variant_config("H1-2B~retr~p20") == VariantConfig("H1-2B", "retr", 20)
+    with pytest.raises(KeyError):
+        variant_config("H1-2B~nope")
 
 
 def test_variant_path_is_content_addressed(tmp_path) -> None:

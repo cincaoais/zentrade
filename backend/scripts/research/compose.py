@@ -1,4 +1,4 @@
-"""Compose the 18 research variants into ZenTrade signal tables.
+"""Compose the 71 research variants into ZenTrade signal tables.
 
 Usage::
 
@@ -27,6 +27,7 @@ from app.research.bars import load_bars, tradable_symbols
 from app.research.chan_replay import load_chan_points
 from app.research.compose import compose_table, with_atr14
 from app.research.hypotheses import VARIANTS, Inputs, variant_path
+from app.research.ranking import rank_features
 from app.research.universe import UniverseParams, eligibility, universe_path
 
 logger = logging.getLogger("compose")
@@ -68,7 +69,7 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     parser = argparse.ArgumentParser(
-        description="Compose the 18 research hypotheses into signal tables"
+        description="Compose the 71 research hypotheses into signal tables"
     )
     parser.add_argument(
         "--data-dir",
@@ -78,7 +79,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--variants",
         default=None,
-        help="comma separated variant ids (default: all 18)",
+        help="comma separated variant ids (default: all 71)",
     )
     args = parser.parse_args(argv)
 
@@ -96,12 +97,16 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("loading research inputs from %s", data_dir)
     # ATR is computed once over the full store and reused by every variant.
     bars = with_atr14(load_bars(data_dir))
+    spy = load_bars(data_dir, symbols=["SPY"])
+    # Ranking features are also computed once and passed to the ranked variants.
+    features = rank_features(bars, spy)
     inputs = Inputs(
         chan_points=load_chan_points(data_dir),
         wyk_events=load_wyckoff_events(data_dir),
         wyk_ranges=load_wyckoff_ranges(data_dir),
         bars=bars,
-        spy=load_bars(data_dir, symbols=["SPY"]),
+        spy=spy,
+        features=features,
     )
     elig = _eligibility(data_dir, bars)
 

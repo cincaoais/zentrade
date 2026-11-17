@@ -1,9 +1,11 @@
-"""The 18 v1 research hypotheses as signal builders.
+"""The 71 research hypotheses: 18 v1 signal builders plus the ranking grid.
 
 Each variant turns point-in-time Chan points, Wyckoff events/ranges and stored
 bars into a :class:`~app.research.compose.Signals`: entry rows carry the
 decision date ``t`` and the invalidation price that the composer turns into a
-shared entry/exit table. No variant reads anything else from the store.
+shared entry/exit table. A ranked variant is a v1 base with a causal
+``raw_score`` column attached; the composer orders the slots by that score.
+No variant reads anything else from the store.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ import polars as pl
 
 from app.research.compose import Signals
 from app.research.features import rel_volume
+from app.research.ranking import chan_retracement, rank_features, raw_scores
 from app.research.wyckoff.accumulation import ACC_KINDS
 
 CHAN_BUYS = ("1B", "2B", "3B")
@@ -47,6 +50,16 @@ class Inputs:
     wyk_ranges: pl.DataFrame
     bars: pl.DataFrame
     spy: pl.DataFrame
+    features: pl.DataFrame | None = None
+
+
+@dataclass(frozen=True)
+class VariantConfig:
+    """Pre-declared grid coordinates for one variant id."""
+
+    base: str
+    rank: str
+    slots: int
 
 
 # ---------------------------------------------------------------------------
@@ -468,6 +481,81 @@ VARIANTS.update(
         "H6-H5-w10": _h6_variant("H5-w10"),
     }
 )
+
+# ---------------------------------------------------------------------------
+# Phase-2 ranking grid: 53 pre-declared base x rank x slots variants
+# ---------------------------------------------------------------------------
+
+# ``retr`` is a Chan rank: the stroke types and the date the base trades on.
+_RETR_SPECS: dict[str, tuple[tuple[str, ...], str]] = {
+    "H1c-2B": (("2B",), "confirmed_date"),
+    "H1-2B": (("2B",), "known_date"),
+    "H1c-3B": (("3B",), "confirmed_date"),
+    "H1-3B": (("3B",), "known_date"),
+    "H1-1B": (("1B",), "known_date"),
+}
+
+_GRID_A_BASES = ("H1c-2B", "H1-2B", "H1c-3B", "H1-3B", "H1-1B")
+_GRID_A_RANKS = ("rs", "retr", "risk", "relvol", "lowvol")
+_GRID_B_BASES = ("H5-w10", "H2-sos")
+_GRID_B_RANKS = ("rs", "risk", "relvol", "lowvol")
+_GRID_C_BASES = ("H1c-2B", "H1-2B")
+_GRID_C_RANKS = ("rs", "retr", "risk", "relvol", "lowvol")
+
+
+def _ranked_variant(base_id: str, rank: str) -> Callable[[Inputs], Signals]:
+    def variant(inputs: Inputs) -> Signals:
+        base = VARIANTS[base_id](inputs)
+        features = (
+            inputs.features
+            if inputs.features is not None
+            else rank_features(inputs.bars, inputs.spy)
+        )
+        retr = None
+        if rank == "retr":
+            types, date_column = _RETR_SPECS[base_id]
+            retr = chan_retracement(
+                inputs.chan_points, inputs.bars, types, date_column
+            )
+        return Signals(
+            entries=raw_scores(base.entries, rank, features, retr),
+            sells=base.sells,
+        )
+
+    return variant
+
+
+def _grid_variant_id(base_id: str, rank: str, slots: int) -> str:
+    return f"{base_id}~{rank}" if slots == 10 else f"{base_id}~{rank}~p{slots}"
+
+
+VARIANT_CONFIGS: dict[str, VariantConfig] = {
+    variant_id: VariantConfig(variant_id, "hash", 10) for variant_id in VARIANTS
+}
+
+for _base in _GRID_A_BASES:
+    for _rank in _GRID_A_RANKS:
+        _variant_id = _grid_variant_id(_base, _rank, 10)
+        VARIANT_CONFIGS[_variant_id] = VariantConfig(_base, _rank, 10)
+        VARIANTS[_variant_id] = _ranked_variant(_base, _rank)
+
+for _base in _GRID_B_BASES:
+    for _rank in _GRID_B_RANKS:
+        _variant_id = _grid_variant_id(_base, _rank, 10)
+        VARIANT_CONFIGS[_variant_id] = VariantConfig(_base, _rank, 10)
+        VARIANTS[_variant_id] = _ranked_variant(_base, _rank)
+
+for _base in _GRID_C_BASES:
+    for _rank in _GRID_C_RANKS:
+        for _slots in (5, 20):
+            _variant_id = _grid_variant_id(_base, _rank, _slots)
+            VARIANT_CONFIGS[_variant_id] = VariantConfig(_base, _rank, _slots)
+            VARIANTS[_variant_id] = _ranked_variant(_base, _rank)
+
+
+def variant_config(variant_id: str) -> VariantConfig:
+    """Grid coordinates for ``variant_id`` (``KeyError`` when unknown)."""
+    return VARIANT_CONFIGS[variant_id]
 
 
 def variant_path(data_dir: Path, variant_id: str, table: pl.DataFrame) -> Path:
