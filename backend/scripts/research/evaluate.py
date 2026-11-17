@@ -21,6 +21,7 @@ import os
 import random
 import sys
 import time
+from dataclasses import asdict
 from datetime import date
 from pathlib import Path
 
@@ -45,6 +46,7 @@ from app.research.evaluate import (
     run_table,
     trading_days,
 )
+from app.research.hypotheses import VARIANT_CONFIGS
 from app.research.metrics import curve_stats
 from app.research.registry import HoldoutLocked, Pins, Registry, check_holdout_allowed
 from app.research.universe import UniverseParams, eligibility
@@ -115,6 +117,10 @@ def _current_pins(data_dir: Path, variant_ids: list[str]) -> Pins:
         wyckoff_version=wyckoff_port_version(),
         table_hashes=table_hashes,
         bridge_hash=file_hash(BRIDGE_PATH),
+        variant_configs={
+            variant_id: asdict(VARIANT_CONFIGS[variant_id])
+            for variant_id in variant_ids
+        },
     )
 
 
@@ -128,19 +134,23 @@ def _init_worker(data_dir: str) -> None:
     _WORKER_SERVICE = _build_service(Path(data_dir))
 
 
-def _run_worker(task: tuple[str, str, date, date]) -> float:
-    path, name, start, end = task
+def _run_worker(task: tuple[str, str, date, date, int]) -> float:
+    path, name, start, end, max_positions = task
     result = run_table(
         _WORKER_SERVICE,
         Path(path),
         Period(name, start, end),
+        max_positions=max_positions,
     )
     return float(curve_stats(equity_frame(result))["cagr"])
 
 
 def _pool_runner(data_dir: Path, workers: int):
-    def runner(paths: list[Path], period: Period) -> list[float]:
-        tasks = [(str(path), period.name, period.start, period.end) for path in paths]
+    def runner(paths: list[Path], period: Period, max_positions: int) -> list[float]:
+        tasks = [
+            (str(path), period.name, period.start, period.end, max_positions)
+            for path in paths
+        ]
         with multiprocessing.Pool(
             processes=workers,
             initializer=_init_worker,
@@ -265,7 +275,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--variants",
         default=None,
-        help="comma separated variant ids (default: all 18)",
+        help="comma separated variant ids (default: all 71)",
     )
     parser.add_argument("--seeds", type=int, default=200, help="random baseline seeds")
     parser.add_argument(
@@ -362,6 +372,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     svc = _build_service(data_dir)
+    configs = {
+        variant_id: asdict(VARIANT_CONFIGS[variant_id])
+        for variant_id in variant_ids
+    }
+    data_generation = KlineRepository(DataStore(data_dir)).get_matrix_data_generation(
+        "stock"
+    )
     ctx = EvalContext(
         svc=svc,
         registry=registry,
@@ -374,6 +391,11 @@ def main(argv: list[str] | None = None) -> int:
         n_trials=registry.n_trials(),
         var_sr_trials=registry.var_sr_trials(),
         trading_days=trading_days(bars, period),
+        configs=configs,
+        random_cache_dir=research_dir / "random_cache",
+        cache_salt=(
+            f"{data_generation}|{UniverseParams().hash()}|{file_hash(BRIDGE_PATH)}"
+        ),
         random_runner=_pool_runner(data_dir, args.workers) if args.workers > 1 else None,
     )
 

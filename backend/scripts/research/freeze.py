@@ -13,12 +13,14 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app.config import settings
 from app.research import RESEARCH_LAST_DATE
+from app.research.hypotheses import VARIANT_CONFIGS
 from app.research.registry import HoldoutLocked, Pins, Registry, freeze
 from app.research.universe import UniverseParams
 from app.research.versions import chan_engine_version, file_hash, wyckoff_port_version
@@ -101,6 +103,10 @@ def main(argv: list[str] | None = None) -> int:
         wyckoff_version=wyckoff_port_version(),
         table_hashes=table_hashes,
         bridge_hash=file_hash(BRIDGE_PATH),
+        variant_configs={
+            variant_id: asdict(VARIANT_CONFIGS[variant_id])
+            for variant_id in variant_ids
+        },
     )
 
     try:
