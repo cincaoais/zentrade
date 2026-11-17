@@ -157,11 +157,34 @@ def _pool_runner(data_dir: Path, workers: int):
 # ---------------------------------------------------------------------------
 
 
-def _integrity(data_dir: Path, symbols: list[str]) -> dict:
+def _chan_truncation_one(task: tuple[str, str, int]) -> dict:
+    """One symbol's Chan truncation check (real engine), for the process pool."""
+    from app.research.integrity import chan_truncation_check
+
+    data_dir, symbol, seed = task
+    return chan_truncation_check(Path(data_dir), [symbol], cuts_per_symbol=5, seed=seed)
+
+
+def _chan_truncation_parallel(data_dir: Path, symbols: list[str], workers: int) -> dict:
+    """The real-engine truncation check costs ~20 s per cut (250 cuts): spread
+    symbols over a pool. Each symbol gets its own fixed seed, so it is
+    reproducible regardless of worker scheduling."""
+    tasks = [(str(data_dir), symbol, index) for index, symbol in enumerate(symbols)]
+    if workers <= 1:
+        parts = [_chan_truncation_one(task) for task in tasks]
+    else:
+        with multiprocessing.get_context("spawn").Pool(processes=workers) as pool:
+            parts = pool.map(_chan_truncation_one, tasks, chunksize=1)
+    return {
+        "checked": sum(part["checked"] for part in parts),
+        "mismatches": [item for part in parts for item in part["mismatches"]],
+    }
+
+
+def _integrity(data_dir: Path, symbols: list[str], workers: int = 1) -> dict:
     """Run the Task 13 checks; imported lazily so the runner never owns them."""
     from app.research.chan_replay import load_chan_gone, load_chan_points
     from app.research.integrity import (
-        chan_truncation_check,
         determinism_check,
         phantom_rate,
         wyckoff_truncation_check,
@@ -174,7 +197,7 @@ def _integrity(data_dir: Path, symbols: list[str]) -> dict:
     wyk_symbols = picks[:50]
     determinism_symbols = picks[:10]
 
-    chan = chan_truncation_check(data_dir, chan_symbols, cuts_per_symbol=5, seed=0)
+    chan = _chan_truncation_parallel(data_dir, chan_symbols, workers)
     wyk = wyckoff_truncation_check(data_dir, wyk_symbols, cuts_per_symbol=5, seed=0)
     phantom = phantom_rate(load_chan_points(data_dir), load_chan_gone(data_dir))
     determinism = determinism_check(data_dir, determinism_symbols)
@@ -308,7 +331,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Integrity first: a leak found after hours of backtests would waste them all.
     eligible_symbols = elig.filter(pl.col("eligible"))["symbol"].unique().to_list()
-    integrity = _integrity(data_dir, eligible_symbols)
+    integrity = _integrity(data_dir, eligible_symbols, args.workers)
     if _integrity_failed(integrity):
         print("evaluate: integrity check failed; aborting", file=sys.stderr)
         return 1
