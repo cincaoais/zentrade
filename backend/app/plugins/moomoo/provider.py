@@ -55,11 +55,24 @@ US_EXCHANGES = {"US_NYSE": "NYSE", "US_NASDAQ": "NASDAQ"}
 # moomoo reports an unknown listing date as the Unix epoch.
 UNKNOWN_LISTING_DATE = dt.date(1970, 1, 1)
 
-# Realtime snapshots: OpenD allows 60 calls / 30 s and 400 codes per call.
-SNAPSHOT_RPM = 60
+# Realtime snapshots: OpenD allows 60 calls / 30 s and 400 codes per call. We pace
+# at 50 to leave margin: pacing at exactly 60 hit "high frequency" on 2026-11-17
+# (client and server windows do not line up).
+SNAPSHOT_RPM = 50
 SNAPSHOT_WINDOW_S = 30.0
+# get_rehab: same 60 / 30 s server limit, same margin.
+REHAB_CALLS_PER_WINDOW = 50
+REHAB_WINDOW_S = 30.0
+# After a "high frequency" reply, wait one full window and retry once.
+RATE_LIMIT_BACKOFF_S = 30.0
 SNAPSHOT_CHUNK = 400
 UNIVERSE_CACHE_SECONDS = 3600.0
+
+def _is_rate_limited(data: object) -> bool:
+    """True for OpenD's rate-limit reply ("... high frequency ..." / "频率")."""
+    text = str(data).lower()
+    return "frequen" in text or "频率" in text
+
 
 # Injected in tests (and usable to share one connection policy at process level).
 _CTX_FACTORY: Callable[[str, int], Any] | None = None
@@ -513,7 +526,9 @@ class MoomooProvider:
 
         pending = [symbol for symbol in wanted if symbol not in covered]
         if pending:
-            pacer = Pacer(60, 30.0, clock=self._clock, sleep=self._sleep)
+            pacer = Pacer(
+                REHAB_CALLS_PER_WINDOW, REHAB_WINDOW_S, clock=self._clock, sleep=self._sleep
+            )
             fetched: list[dict[str, Any]] = []
             total = len(pending)
             with open_ctx() as ctx:
@@ -521,6 +536,10 @@ class MoomooProvider:
                     pacer.wait()
                     try:
                         ret, data = _unpack_ret(ctx.get_rehab(to_moomoo(symbol)))
+                        if ret != 0 and _is_rate_limited(data):
+                            self._sleep(RATE_LIMIT_BACKOFF_S)
+                            pacer.wait()
+                            ret, data = _unpack_ret(ctx.get_rehab(to_moomoo(symbol)))
                         if ret != 0:
                             raise RuntimeError(
                                 f"get_rehab 失败: ret={ret!r} data={data!r}"
@@ -622,6 +641,10 @@ class MoomooProvider:
                 codes = [to_moomoo(s) for s in symbols[start : start + SNAPSHOT_CHUNK]]
                 pacer.wait()
                 ret, data = _unpack_ret(ctx.get_market_snapshot(codes))
+                if ret != 0 and _is_rate_limited(data):
+                    self._sleep(RATE_LIMIT_BACKOFF_S)
+                    pacer.wait()
+                    ret, data = _unpack_ret(ctx.get_market_snapshot(codes))
                 if ret != 0:
                     raise RuntimeError(
                         f"get_market_snapshot 失败: ret={ret!r} data={data!r}"

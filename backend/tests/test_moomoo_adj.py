@@ -213,6 +213,59 @@ def test_adj_uses_cache_then_rehab(tmp_path) -> None:
     assert nvda["vol_factor"].to_list() == [10.0]
 
 
+def test_rehab_rate_limit_backs_off_and_retries(tmp_path) -> None:
+    """OpenD's "high frequency" reply must not abort the whole sync: wait, retry once."""
+    from app.plugins.moomoo.provider import RATE_LIMIT_BACKOFF_S
+
+    replies = [
+        (-1, "Get Adjusted Factor ... request failed due to high frequency. Maximum 60 times per 30 seconds."),
+        (0, [
+            {
+                "ex_div_date": "2024-06-10",
+                "split_base": 1,
+                "split_ert": 10,
+                "split_ratio": 0.1,
+                "forward_adj_factorA": 0.1,
+                "forward_adj_factorB": 0,
+            }
+        ]),
+    ]
+
+    def _call(*_args: object, **_kwargs: object) -> object:
+        return replies.pop(0)
+
+    from app.plugins.moomoo import provider as provider_module
+
+    clock = FakeClock()
+    ctx = FakeQuoteContext(clock=clock, returns={"get_rehab": _call})
+    provider_module.set_ctx_factory(lambda host, port: ctx)
+    provider = provider_module.MoomooProvider()
+    provider._clock = clock.monotonic
+    sleeps: list[float] = []
+
+    def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock.sleep(seconds)
+
+    provider._sleep = _sleep
+    provider_module.settings = SimpleNamespace(data_dir=tmp_path)
+
+    frame = provider.get_adj_factors(
+        ["NVDA"], start_time=dt.datetime(2024, 1, 1), end_time=dt.datetime(2026, 11, 13)
+    )
+
+    assert len(ctx.calls_named("get_rehab")) == 2
+    assert RATE_LIMIT_BACKOFF_S in sleeps
+    assert frame["ex_factor"].to_list() == [10.0]
+
+
+def test_rehab_pacer_has_margin() -> None:
+    from app.plugins.moomoo.provider import REHAB_CALLS_PER_WINDOW, SNAPSHOT_RPM
+
+    assert REHAB_CALLS_PER_WINDOW <= 50
+    assert SNAPSHOT_RPM <= 50
+
+
 def test_adj_bad_symbol_skipped_others_kept(tmp_path) -> None:
     provider, _ctx, provider_module = _provider(
         tmp_path,
