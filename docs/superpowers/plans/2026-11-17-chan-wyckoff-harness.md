@@ -595,7 +595,7 @@ The registry and frozen file live at `<data_dir>/research/registry.json` and `re
 - Consumes: Tasks 2 and 7–13; ZenTrade `DataStore`, `KlineRepository`, `StrategyEngine`, `BacktestEngine`, `StrategyBacktestService`, `StrategyBacktestConfig` (wiring as in `backend/app/backtest/worker.py:196-219`).
 - Produces:
   - `Period` (dataclass): `name: Literal["dev","holdout"], start: date, end: date`.
-    - `dev_period(elig)` starts at the first date with ≥ 1 eligible symbol and ends at `DEV_END`.
+    - `dev_period(elig)` starts at the first date whose eligible count is ≥ `min(top_n, max daily eligible count)` (a full universe), and ends at `DEV_END`. On the real store this is 2023-11-17: a handful of symbols with older history are eligible from 2023-09-22, but the universe holds 7 names until it jumps to 1,500 on 2023-11-17. Test: `test_dev_period_starts_at_full_universe`.
     - `holdout_period()` is `HOLDOUT_START`–`HOLDOUT_END`.
   - `run_table(svc, table_path: Path, period: Period, slippage_bps: float = 5.0) -> StrategyBacktestResult`, with `StrategyBacktestConfig(strategy_id="research_signal_table", symbols=None, start, end, params={"table_path": str(path)}, max_positions=10, position_sizing="equal", entry_fill="open_t+1", exit_fill="open_t+1", slippage_bps=…, mode="position")`.
   - `folds(period: Period, trading_days: list[date], test_len: int = 126, embargo: int = 5) -> list[Period]`: consecutive windows, each starting `embargo` bars after the previous one ends.
