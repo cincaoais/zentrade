@@ -214,3 +214,14 @@ def test_score_deterministic_and_neutral() -> None:
     }
     assert got == scores
     assert [row["symbol"] for row in table.to_dicts()] == ["AAA", "BBB", "CCC"]
+
+def test_precomputed_atr_gives_identical_table() -> None:
+    from app.research.compose import with_atr14
+
+    closes = [100.0 + i for i in range(len(DATES))]
+    bars = _bars("AAA", closes=closes, opens=closes)
+    signals = Signals(entries=_entries([("AAA", 2, 90.0, "H1-2B")]), sells=_sells([]))
+    plain, plain_log = compose_table(signals, bars, _elig(["AAA"]))
+    fast, fast_log = compose_table(signals, with_atr14(bars), _elig(["AAA"]))
+    assert plain.equals(fast)
+    assert plain_log == fast_log

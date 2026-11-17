@@ -66,6 +66,9 @@ def entry_score(symbol: str, d: date) -> float:
 
 
 def _with_atr(frame: pl.DataFrame) -> pl.DataFrame:
+    """Attach per-symbol ``atr14``; a precomputed column is reused (see ``with_atr14``)."""
+    if "atr14" in frame.columns:
+        return frame
     parts = [
         group.with_columns(
             pl.Series(
@@ -80,6 +83,15 @@ def _with_atr(frame: pl.DataFrame) -> pl.DataFrame:
     if not parts:
         return frame.with_columns(pl.lit(None, dtype=pl.Float64).alias("atr14"))
     return pl.concat(parts)
+
+
+def with_atr14(bars: pl.DataFrame) -> pl.DataFrame:
+    """Return ``bars`` with a causal per-symbol ``atr14`` column.
+
+    Compute this once per run and pass the result to ``compose_table`` and the
+    baselines; both reuse an existing ``atr14`` column instead of recomputing.
+    """
+    return _with_atr(bars)
 
 
 def compose_table(
@@ -112,9 +124,10 @@ def compose_table(
     ineligible = merged.filter(~pl.col("eligible")).height
 
     # 4. Fill-time check on the next stored bar's opening print.
-    bars_core = bars.select("symbol", "date", "open", "high", "low", "close").sort(
-        ["symbol", "date"]
-    )
+    core_columns = ["symbol", "date", "open", "high", "low", "close"]
+    if "atr14" in bars.columns:
+        core_columns.append("atr14")
+    bars_core = bars.select(core_columns).sort(["symbol", "date"])
     next_open = (
         bars_core.select("symbol", "date", "open")
         .with_columns(pl.col("open").shift(-1).over("symbol").alias("next_open"))
