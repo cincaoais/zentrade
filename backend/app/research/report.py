@@ -76,6 +76,24 @@ def _table(header: list[str], rows: list[list[str]]) -> list[str]:
     return lines
 
 
+RANK_COLUMNS = ("hash", "rs", "retr", "risk", "relvol", "lowvol")
+
+
+def _config(result: dict) -> dict:
+    """Return the variant config, defaulting to the v1 hash/10-slots setup."""
+    config = result.get("config") or {}
+    slots = config.get("slots", 10)
+    try:
+        slots = int(slots)
+    except (TypeError, ValueError):
+        slots = 10
+    return {
+        "base": str(config.get("base", result.get("variant_id", ""))),
+        "rank": str(config.get("rank", "hash")),
+        "slots": slots,
+    }
+
+
 def _summary(results: list[dict]) -> list[str]:
     lines = [
         "## Summary",
@@ -87,9 +105,12 @@ def _summary(results: list[dict]) -> list[str]:
     rows: list[list[str]] = []
     for result in results:
         main = result.get("main") or {}
+        config = _config(result)
         rows.append(
             [
                 str(result.get("variant_id", "")),
+                config["rank"],
+                str(config["slots"]),
                 str(main.get("trades", 0)),
                 _percent(main.get("win_rate")),
                 _number(main.get("avg_r"), 3),
@@ -106,6 +127,8 @@ def _summary(results: list[dict]) -> list[str]:
         _table(
             [
                 "Variant",
+                "Rank",
+                "Slots",
                 "Trades",
                 "Win rate",
                 "Avg R",
@@ -127,6 +150,52 @@ def _summary(results: list[dict]) -> list[str]:
     ]
     if notes:
         lines.extend(["", *notes])
+    return lines
+
+
+def _ranking_grid(results: list[dict]) -> list[str]:
+    """CAGR / random percentile per base variant and ranking, per slot count."""
+    by_slot: dict[int, dict[str, dict[str, dict]]] = {}
+    base_order: dict[int, list[str]] = {}
+    for result in results:
+        config = _config(result)
+        slots = config["slots"]
+        base = config["base"]
+        per_slot = by_slot.setdefault(slots, {})
+        bases = base_order.setdefault(slots, [])
+        if base not in per_slot:
+            per_slot[base] = {}
+            bases.append(base)
+        per_slot[base][config["rank"]] = result
+
+    lines = [
+        "## Ranking grid",
+        "",
+        "Each cell is CAGR / random percentile for the base variant ranked by that "
+        "signal. — means the rank was not run for this base.",
+        "",
+    ]
+    if not by_slot:
+        lines.append("No results.")
+        return lines
+    for slots in sorted(by_slot):
+        lines.extend([f"### Slots {slots}", ""])
+        rows: list[list[str]] = []
+        for base in base_order[slots]:
+            row = [base]
+            for rank in RANK_COLUMNS:
+                result = by_slot[slots][base].get(rank)
+                if result is None:
+                    row.append("—")
+                    continue
+                main = result.get("main") or {}
+                row.append(
+                    f"{_percent(main.get('cagr'))} / "
+                    f"{_percent_points(result.get('random_percentile'))}"
+                )
+            rows.append(row)
+        lines.extend(_table(["Base", *RANK_COLUMNS], rows))
+        lines.append("")
     return lines
 
 
@@ -368,6 +437,8 @@ def write_report(
         "costs and execution.",
         "",
         *_summary(results),
+        "",
+        *_ranking_grid(results),
         "",
         *_baselines(baselines),
         "",
