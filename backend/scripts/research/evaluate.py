@@ -272,7 +272,13 @@ def main(argv: list[str] | None = None) -> int:
         "--workers",
         type=int,
         default=_default_workers(),
-        help="random-baseline worker processes",
+        help="random-baseline worker processes (each holds a full backtest service, ~2.3 GB)",
+    )
+    parser.add_argument(
+        "--integrity-workers",
+        type=int,
+        default=None,
+        help="Chan truncation-check processes (~0.25 GB each; default: --workers)",
     )
     parser.add_argument(
         "--data-dir",
@@ -332,7 +338,8 @@ def main(argv: list[str] | None = None) -> int:
     # Integrity first: a leak found after hours of backtests would waste them all.
     eligible_symbols = elig.filter(pl.col("eligible"))["symbol"].unique().to_list()
     logger.info("integrity checks (Chan truncation replays the real engine; ~30 min)")
-    integrity = _integrity(data_dir, eligible_symbols, args.workers)
+    integrity_workers = args.integrity_workers or args.workers
+    integrity = _integrity(data_dir, eligible_symbols, integrity_workers)
     integrity_path = research_dir / f"integrity-{args.period}.json"
     integrity_path.parent.mkdir(parents=True, exist_ok=True)
     integrity_path.write_text(json.dumps(integrity, indent=1, default=str), encoding="utf-8")
