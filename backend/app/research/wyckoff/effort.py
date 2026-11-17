@@ -364,7 +364,7 @@ def choch_events(k: Candles, lag: int = 3, window: int = 60, approach_atr: float
         sl = slice(s, t + 1)
         at = float(a[t])
 
-        def mean(x):
+        def mean(x, sl=sl):
             return float(np.mean(x[sl]))
 
         drop = float(np.max(np.maximum.accumulate(h[sl])[:-1] - l[s + 1:t + 1])) if n_h > 1 else 0.0

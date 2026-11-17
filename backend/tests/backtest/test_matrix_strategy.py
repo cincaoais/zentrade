@@ -326,7 +326,8 @@ def test_builtin_matrix_strategies_use_their_declared_formula_modules():
     #   ibs_mean_reversion / williams_r2_reversion / connors_rsi2 /
     #   mdd_multi_down_days / three_down_days_overnight / five_day_low_overnight
     # 2026-10-23 +1 momentum_rsi2_pullback (动量RSI2回调, 用户给定规则, 公开)
-    assert len(strategy_files) == 39
+    # 2026-11-17 +1 research_signal_table (研究信号表桥接, research_only)
+    assert len(strategy_files) == 40
     for strategy_path in strategy_files:
         strategy = StrategyEngine._load_file(strategy_path)
         assert strategy.execution_backend == "matrix_native"
@@ -796,7 +797,7 @@ def test_registered_builtin_matrix_strategies_share_one_cache_profile():
         if s.execution_backend != "minute_filter"
     )
 
-    assert len(strategies) == 39  # +tv_tke +6 均值回归移植 (2026-10-14) +动量RSI2回调 (2026-10-23)
+    assert len(strategies) == 40  # +tv_tke +6 均值回归移植 (2026-10-14) +动量RSI2回调 (2026-10-23) +研究信号表 (2026-11-17)
     assert all(strategy.execution_backend == "matrix_native" for strategy in strategies)
     assert profile.warmup_bars > 0
     assert profile.forward_bars == max(int(strategy.max_hold_days or 0) for strategy in strategies)

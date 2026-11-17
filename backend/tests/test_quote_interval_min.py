@@ -13,12 +13,21 @@ def _bare() -> QuoteService:
     return QuoteService.__new__(QuoteService)
 
 
+def _no_realtime_provider(monkeypatch) -> None:
+    """隔离本机偏好: 选了 moomoo 等自报下限的实时源时, 下限会抬高 (见 _provider_min_interval)。"""
+    from app.services import preferences
+
+    monkeypatch.setattr(preferences, "get_realtime_data_provider", lambda: None)
+
+
 def test_min_interval_is_1s(monkeypatch):
-    """厂商档位查表已退役: 下限恒为通用 1s。"""
+    """厂商档位查表已退役: 未选实时源时下限为通用 1s。"""
+    _no_realtime_provider(monkeypatch)
     assert _bare().get_min_interval() == 1.0
 
 
 def test_clamp_allows_1s_and_caps_max(monkeypatch):
+    _no_realtime_provider(monkeypatch)
     qs = _bare()
     assert qs._clamp_interval(1.0) == 1.0
     assert qs._clamp_interval(0.5) == 1.0

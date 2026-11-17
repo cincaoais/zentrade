@@ -60,8 +60,8 @@ def test_all_builtin_strategies_use_matrix_backend_only():
     assert len([s for s in public_strategies if s.execution_backend == "matrix_native"]) == 37
     strategies = [engine.get(meta["id"]) for meta in engine.list_strategies(include_research=True)]
     matrix_strategies = [s for s in strategies if s.execution_backend == "matrix_native"]
-    # 37 公开 + high_turnover_surge + factor_rank_research
-    assert len(matrix_strategies) == 39
+    # 37 公开 + high_turnover_surge + factor_rank_research + research_signal_table (2026-11-17)
+    assert len(matrix_strategies) == 40
     assert engine.get("high_turnover_surge").meta.get("research_only") is True
     assert all(s.matrix_strategy is not None for s in matrix_strategies)
     assert all(s.filter_fn is None for s in matrix_strategies)

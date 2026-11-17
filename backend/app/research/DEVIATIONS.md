@@ -17,7 +17,7 @@ code). The port keeps every threshold and every detector rule verbatim. This fil
 | `backend/app/research/wyckoff/ranges.py` | Header added; imports rewritten | New package location. |
 | `backend/app/research/wyckoff/accumulation.py` | Header added; imports rewritten | New package location. |
 | `backend/app/research/wyckoff/distribution.py` | Header added; imports rewritten | New package location. |
-| `backend/app/research/wyckoff/effort.py` | Header added; imports rewritten | New package location. |
+| `backend/app/research/wyckoff/effort.py` | Header added; imports rewritten; `choch` helper `mean` binds the loop slice as a default argument (`def mean(x, sl=sl)`) | New package location; the repo lint test forbids unbound loop-variable closures (ruff B023). The helper is called inside the same iteration, so output is unchanged. |
 | `backend/app/research/wyckoff/quality.py` | Header added; imports rewritten | New package location. |
 | `backend/app/research/wyckoff/us_bars.py` | New adapter replacing `prepare()` for US daily bars | Input `date, open, high, low, close, volume`; drops `high <= low`; `t`/`tc` = UTC midnight / +1 day; `post_gap` when the stored-bar gap is > 5 calendar days; `holiday`, `holiday_lowvol`, `news` all False; D1 `rv`/`ae`; `v` = real share volume, `v2`/`rv2`/`ae2` NaN; no TICK rounding. |
 
