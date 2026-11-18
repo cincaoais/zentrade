@@ -117,6 +117,8 @@
 
     let current = -1;
     let windowDays = 126;
+    const TARGET_WIDTH = 2.2 * slots;
+    let dx = TARGET_WIDTH / Math.max(1, windowDays);
     let selectedId = null;
     let selectCb = null;
     let needsRender = true;
@@ -138,6 +140,10 @@
         Math.round((rect && rect.height) || container.clientHeight || 600)
       );
       return { w: w, h: h };
+    }
+
+    function updateDx() {
+      dx = TARGET_WIDTH / Math.max(1, windowDays);
     }
 
     const dims = measure();
@@ -170,7 +176,7 @@
     scene.add(fill);
 
     // --- lane strips -------------------------------------------------------
-    const laneWidth = Math.max(days.length, 1);
+    const laneCount = Math.max(days.length, 1);
     const laneGeo = new THREE.PlaneGeometry(1, 1);
     const laneMat = new THREE.MeshBasicMaterial({
       color: 0x121a28,
@@ -179,12 +185,14 @@
       side: THREE.DoubleSide,
       depthWrite: false,
     });
+    const laneStrips = [];
     for (let s = 0; s < slots; s++) {
       const strip = new THREE.Mesh(laneGeo, laneMat);
       strip.rotation.x = -Math.PI / 2;
-      strip.scale.set(laneWidth, 0.9, 1);
-      strip.position.set((laneWidth - 1) / 2, -0.02, s);
+      strip.scale.set(laneCount * dx, 0.9, 1);
+      strip.position.set(((laneCount - 1) / 2) * dx, -0.02, s);
       scene.add(strip);
+      laneStrips.push(strip);
     }
 
     // --- text sprites ------------------------------------------------------
@@ -239,7 +247,7 @@
       "Jan", "Feb", "Mar", "Apr", "May", "Jun",
       "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
-    let monthLabels = 0;
+    const monthSprites = [];
     for (let k = 0; k < days.length; k++) {
       const iso = days[k];
       const month = Number(iso.slice(5, 7)) - 1;
@@ -250,11 +258,10 @@
       const yy = iso.slice(2, 4);
       const text = MONTHS[month] + " '" + yy;
       const sprite = textSprite(text, { color: "#64748b", height: 0.9, fontSize: 40 });
-      sprite.position.set(k, 0.35, slots + 0.9);
+      sprite.position.set(k * dx, 0.35, slots + 0.9);
       scene.add(sprite);
-      monthLabels++;
+      monthSprites.push({ sprite: sprite, day: k });
     }
-    void monthLabels;
 
     // --- back wall with equity / SPY --------------------------------------
     const wallGeo = new THREE.PlaneGeometry(1, 1);
@@ -263,8 +270,8 @@
       side: THREE.DoubleSide,
     });
     const wall = new THREE.Mesh(wallGeo, wallMat);
-    wall.scale.set(laneWidth, wallHeight, 1);
-    wall.position.set((laneWidth - 1) / 2, wallBase + wallHeight / 2, wallZ - 0.05);
+    wall.scale.set(laneCount * dx, wallHeight, 1);
+    wall.position.set(((laneCount - 1) / 2) * dx, wallBase + wallHeight / 2, wallZ - 0.05);
     scene.add(wall);
 
     // Fixed y scale over the whole period so the lines never rescale mid-replay.
@@ -287,17 +294,26 @@
       return wallBase + ((v - wallLo) / wallSpan) * wallHeight;
     }
 
-    function makeLine(values, color, fallback) {
-      const positions = new Float32Array(Math.max(days.length, 1) * 3);
+    function writeLinePositions(line) {
+      const values = line.userData.values;
+      const fallback = line.userData.fallback;
+      const attr = line.geometry.getAttribute("position");
+      const positions = attr.array;
       let last = fallback == null ? 1 : fallback;
       for (let k = 0; k < days.length; k++) {
         let v = values[k];
         if (v == null || !isFinite(v)) v = last;
         else last = v;
-        positions[k * 3] = k;
+        positions[k * 3] = k * dx;
         positions[k * 3 + 1] = wallY(v);
         positions[k * 3 + 2] = wallZ;
       }
+      attr.needsUpdate = true;
+      line.geometry.computeBoundingSphere();
+    }
+
+    function makeLine(values, color, fallback) {
+      const positions = new Float32Array(Math.max(days.length, 1) * 3);
       const geo = new THREE.BufferGeometry();
       geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
       geo.setDrawRange(0, 0);
@@ -307,12 +323,20 @@
         opacity: 0.9,
       });
       const line = new THREE.Line(geo, mat);
+      line.userData.values = values;
+      line.userData.fallback = fallback;
+      writeLinePositions(line);
       scene.add(line);
       return line;
     }
 
     const equityLine = makeLine(equityValues, 0xffffff, 1);
     const spyLine = makeLine(spyValues, 0x9ca3af, 1);
+
+    function refreshLines() {
+      writeLinePositions(equityLine);
+      writeLinePositions(spyLine);
+    }
 
     // --- cursor ------------------------------------------------------------
     const cursorGeo = new THREE.PlaneGeometry(1, 1);
@@ -392,14 +416,19 @@
       const vfov = (camera.fov * Math.PI) / 180;
       const aspect = Math.max(0.2, camera.aspect || 1);
       const hfov = 2 * Math.atan(Math.tan(vfov / 2) * aspect);
-      const widthDist = (Math.max(8, windowDays) / 2 / Math.tan(hfov / 2)) * 1.2;
+      const visibleWidth = Math.max(4, windowDays * dx);
+      const widthDist = (visibleWidth / 2 / Math.tan(hfov / 2)) * 1.2;
       const heightDist =
         (Math.max(6, slots + 2) / 2 / Math.tan(vfov / 2)) * 1.3;
       return Math.max(12, widthDist, heightDist);
     }
 
     function follow(i, force) {
-      const center = (i == null ? 0 : i) - (Math.max(1, windowDays) - 1) / 2;
+      // Frame the window that ends at day i; before day windowDays-1 keep the
+      // window anchored at day 0 so the first trades are not pushed off-screen.
+      const span = Math.max(1, windowDays) - 1;
+      const left = Math.max(0, (i == null ? 0 : i) - span);
+      const center = (left + span / 2) * dx;
       if (force || lastCenter === null) {
         controls.target.set(center, wallBase + wallHeight * 0.3, laneCenter);
         const dir = new THREE.Vector3(0.18, 0.62, 0.76).normalize();
@@ -419,8 +448,28 @@
     function updateLaneLabels() {
       const left = Math.max(0, current - Math.max(1, windowDays) + 1);
       for (let k = 0; k < laneLabels.length; k++) {
-        laneLabels[k].sprite.position.x = left - 2.5;
+        laneLabels[k].sprite.position.x = (left - 2.5) * dx;
       }
+    }
+
+    function updateMonthTicks() {
+      for (let k = 0; k < monthSprites.length; k++) {
+        monthSprites[k].sprite.position.x = monthSprites[k].day * dx;
+      }
+    }
+
+    // Re-apply the current day width to everything that spans the x axis.
+    function applyDayScale() {
+      const axisWidth = Math.max(days.length, 1) * dx;
+      const axisCenter = ((Math.max(days.length, 1) - 1) / 2) * dx;
+      for (let k = 0; k < laneStrips.length; k++) {
+        laneStrips[k].scale.x = axisWidth;
+        laneStrips[k].position.x = axisCenter;
+      }
+      wall.scale.x = axisWidth;
+      wall.position.x = axisCenter;
+      updateMonthTicks();
+      updateLaneLabels();
     }
 
     function updateOutline() {
@@ -447,8 +496,8 @@
         const width = Math.max(0.2, b.x1 - b.x0);
         const cx = Math.min((b.x0 + b.x1) / 2, current - width / 2);
         mesh.visible = true;
-        mesh.position.set(cx, b.h / 2, b.z);
-        mesh.scale.set(width, b.h, 0.72);
+        mesh.position.set(cx * dx, b.h / 2, b.z);
+        mesh.scale.set(width * dx, b.h, 0.72);
         if (b.open) {
           mesh.material = b.color === GREEN ? openGreen : openRed;
         } else {
@@ -459,7 +508,7 @@
       updateOutline();
 
       cursor.visible = current >= 0;
-      cursor.position.x = current;
+      cursor.position.x = current * dx;
 
       const count = Math.max(0, current + 1);
       equityLine.geometry.setDrawRange(0, count);
@@ -473,8 +522,11 @@
     function setWindow(n) {
       const next = Math.round(Number(n));
       windowDays = isFinite(next) && next > 0 ? next : 126;
+      updateDx();
+      refreshLines();
+      applyDayScale();
       lastCenter = null;
-      updateLaneLabels();
+      setDay(current);
       follow(current, true);
       needsRender = true;
     }
