@@ -1,6 +1,7 @@
 # Step 4a: Forward test of the research leads on moomoo SIMULATE
 
-Status: draft v2 for the user's review (2026-11-18). Approach A chosen by the user ("go with A then. As detail as
+Status: v2 approved by the user (2026-11-18: "Looks good to me. You may proceed."); section 12 holds the user's
+answers. Approach A chosen by the user ("go with A then. As detail as
 you can to prevent illusion and mistake"). v2 follows a builder check (pi worker, 2026-11-18) that found six places
 where v1 contradicted the code; section 15 lists them and what changed.
 
@@ -276,7 +277,7 @@ report.
 
 ### 6.10 CLI
 
-`scripts/forward/run.py`: `rehearse`, `register`, `dry-run`, `daemon`, `night --date`, `morning`, `reconcile`,
+`scripts/forward/run.py`: `rehearse`, `register`, `flatten --confirm`, `dry-run`, `daemon`, `night --date`, `morning`, `reconcile`,
 `parity`, `status [--check-account]`, `stop`, `report`. The daemon runs section 5 and is started by the user in an
 Orca terminal; it is not in the web app's scheduler, so the web app can restart without touching orders.
 
@@ -335,6 +336,10 @@ compares the hashes of the pinned files with the registration fixture.
    before going on.
 3. **User-run read-only check**: `forward status --check-account` shows the SIMULATE account's type, cash and
    positions.
+3b. **Flatten**: if the account holds positions or open orders, `forward flatten --confirm` cancels the open orders
+   and sells every position at market during regular hours through the same SIMULATE-only context, pacing and
+   journal as M3 (keys `fw-flatten-<yyyymmdd>-<symbol>`), then re-reads the account until it is flat. The user
+   approved closing pre-existing positions; the command still prints the list and needs `--confirm`.
 4. **Dry run, 10 trading days**: the daemon runs everything except sending orders (S1 watches and logs what it
    would send). It must produce a decision every morning and 0 `logic_mismatch`. On one day the user runs one 1-share
    test order and cancel with a test remark, to verify the remark round trip, the order status fields and the fill
@@ -348,18 +353,17 @@ Between M2 and M3: `review(actions) -> actions`, returning the actions unchanged
 there and must record vetoed entries as shadow trades. Whether a vetoed slot goes to the next candidate is a step 5
 decision; it changes the engine book, so step 5 will need its own registration.
 
-## 12. Decisions for the user
+## 12. Decisions by the user (2026-11-18)
 
-- Q1. The −15% stop is part of the research rules and is checked during the day. Keeping it faithfully needs the
-  daemon, OpenD and the PC running for the whole US session (09:30-16:00 ET) on every trading day, not just at the
-  open. If that is not possible, a missed stop is sold at the next open and recorded as `stop_missed`, which makes the
-  live book worse than the engine book on those days.
-- Q2. Capital per strategy. The research used $1,000,000 per variant. Whole-share rounding and the $1 minimum
-  commission are negligible at that size and noticeable at small sizes. Proposal: $1,000,000 each if the SIMULATE
-  account holds at least $2,000,000; otherwise half of the account's cash each. The account cash is unknown until
-  step 3 of the rollout.
-- Q3. The SIMULATE account must be used only by this runner (no manual trades in it), because reconciliation assumes
-  every position belongs to a strategy lot.
+- Q1. The −15% stop watch runs the whole US session: **yes, the PC stays on** (daemon and OpenD up 09:30-16:00 ET).
+  A stop missed anyway is sold at the next open and recorded `stop_missed`.
+- Q2. Capital: the user confirms the SIMULATE account holds **more than $1,000,000** (exact amount unknown). Rule:
+  $1,000,000 per strategy if the account's cash is at least $2,000,000; otherwise each strategy gets half of the
+  cash, rounded down to the nearest $10,000. Fixed at registration from the `--check-account` reading and written
+  into the registration.
+- Q3. The SIMULATE account is used only by this runner. **Positions already in it may be closed** (user: "if the
+  simulated account has opening stock, you can close it"). Rollout step 3b does this with the runner's own guarded
+  SIMULATE code, never ad hoc, and records every order.
 
 ## 13. Out of scope, next
 
