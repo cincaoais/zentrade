@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Strategy Replay</title>
+  <link rel="stylesheet" href="viz.css">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <header id="topbar">
+      <span id="variant">—</span>
+      <span class="sep">·</span>
+      <span id="period">—</span>
+      <span class="sep">·</span>
+      <span id="range">—</span>
+      <span id="badge" class="badge" hidden></span>
+    </header>
+
+    <div id="timeline" aria-label="3D slot timeline"></div>
+    <canvas id="candles" aria-label="Candlestick chart"></canvas>
+    <section id="replay" aria-label="Replay controls"></section>
+  </div>
+
+  <div id="error" role="alert" hidden></div>
+
+  <!-- Classic scripts: everything attaches to window.ZT (works from file://). -->
+  <script src="js/data.js"></script>
+  <script src="js/timeline.js"></script>
+  <script src="js/candles.js"></script>
+  <script src="js/replay.js"></script>
+  <script src="js/main.js"></script>
+
+  <!-- Data: prefer the exported variant, fall back to the synthetic sample. -->
+  <script>
+    (function () {
+      window.ZT_VIZ_READY = new Promise(function (resolve) {
+        function done() { resolve(window.ZT_VIZ || null); }
+        function loadSample() {
+          var sample = document.createElement('script');
+          sample.src = 'data/sample.js';
+          sample.onload = done;
+          sample.onerror = function () { done(); };
+          document.body.appendChild(sample);
+        }
+        var current = document.createElement('script');
+        current.src = 'data/current.js';
+        current.onload = function () {
+          if (window.ZT_VIZ) done();
+          else loadSample();
+        };
+        current.onerror = loadSample;
+        document.body.appendChild(current);
+      });
+    })();
+  </script>
+
+  <script type="module">
+    const showError = (message) => {
+      const box = document.getElementById('error');
+      if (!box) return;
+      box.hidden = false;
+      box.textContent = box.textContent ? box.textContent + '\n' + message : message;
+    };
+
+    // Wait until the classic data script has run (current.js or sample.js).
+    const data = await window.ZT_VIZ_READY;
+    if (!data) showError('No data loaded: data/current.js and data/sample.js are both missing or invalid.');
+
+    // three.js is only loaded here; every other file is a classic script.
+    try {
+      const THREE = await import('three');
+      window.THREE = THREE;
+      const { OrbitControls } = await import('three/addons/controls/OrbitControls.js');
+      window.ZT = window.ZT || {};
+      window.ZT.OrbitControls = OrbitControls;
+    } catch (err) {
+      showError('three.js failed to load: ' + (err && err.message ? err.message : err));
+    }
+
+    if (!window.ZT || typeof window.ZT.main !== 'function') {
+      showError('js/main.js is missing (ZT.main undefined).');
+    } else {
+      try {
+        window.ZT.main();
+      } catch (err) {
+        showError('ZT.main() failed: ' + (err && err.stack ? err.stack : err));
+      }
+    }
+  </script>
+</body>
+</html>

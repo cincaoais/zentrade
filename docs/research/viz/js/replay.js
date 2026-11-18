@@ -101,7 +101,7 @@
 
     const days = data.days || [];
     const slots = (data.meta && data.meta.slots) || 0;
-    const state = { i: 0, speed: 1, playing: false, tf: 'D', zoom: 21 };
+    const state = { i: 0, speed: 1, playing: false, tf: 'D', zoom: 63 };
     const dayCbs = [];
     const timeframeCbs = [];
     const zoomCbs = [];
@@ -263,7 +263,7 @@
             el(
               'span',
               'replay-status',
-              s.taken ? '✓ taken' : '— skipped (slots full)',
+              s.taken ? '✓ taken' : '— not taken',
             ),
           );
           signalsList.appendChild(row);

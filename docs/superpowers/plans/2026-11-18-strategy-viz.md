@@ -12,7 +12,7 @@
 - The page works from `file://` with no build step: our code is **classic scripts** (no `import`/`export`) that attach to `window.ZT`; only `index.html` contains one inline `<script type="module">` that imports three.js from a CDN via an import map and then calls `ZT.main()`.
 - three.js `0.170.0` via `https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js` and `.../examples/jsm/controls/OrbitControls.js` (import map keys `three` and `three/addons/`). Exposed as `window.THREE` and `window.ZT.OrbitControls`.
 - Candlestick chart uses Canvas 2D (text labels); the timeline uses three.js.
-- No npm installs. JS tests: `node --test docs/research/viz/tests/` (Node 22, built-in runner), loading classic scripts with `vm.runInContext` on a fresh context where `window = globalThis`.
+- No npm installs. JS tests: `node --test docs/research/viz/tests/*.test.mjs` (Node 22, built-in runner), loading classic scripts with `vm.runInContext` on a fresh context where `window = globalThis`.
 - Python: no OpenD, no network in tests, tests never write the real data dir.
 
 ## Files
