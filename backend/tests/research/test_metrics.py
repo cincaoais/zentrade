@@ -116,3 +116,11 @@ def test_trade_r_floor() -> None:
     ]
     # Risk denominator: max(100 - 99.9, 0.5 * 2) = 1.0.
     assert trade_r(trades, table) == pytest.approx([1.0])
+
+def test_exposure_uses_slot_count() -> None:
+    from app.research.metrics import exposure
+
+    trades = [{"duration": 10}] * 5  # 50 position-days
+    assert exposure(trades, 10) == pytest.approx(0.5)
+    assert exposure(trades, 10, slots=5) == pytest.approx(1.0)
+    assert exposure(trades, 10, slots=20) == pytest.approx(0.25)

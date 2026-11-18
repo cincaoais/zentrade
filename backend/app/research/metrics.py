@@ -189,8 +189,8 @@ def curve_stats(equity: pl.DataFrame) -> dict:
     }
 
 
-def exposure(trades: list[dict], n_days: int) -> float:
-    """Average fraction of the ten portfolio slots held per day."""
+def exposure(trades: list[dict], n_days: int, slots: int = MAX_POSITIONS) -> float:
+    """Average fraction of the ``slots`` portfolio slots held per day."""
     if n_days <= 0:
         return 0.0
 
@@ -206,7 +206,7 @@ def exposure(trades: list[dict], n_days: int) -> float:
             continue
         position_days += max(0, (exit_date - entry).days + 1)
 
-    return position_days / (float(n_days) * MAX_POSITIONS)
+    return position_days / (float(n_days) * slots)
 
 
 def psr(sr: float, sr_ref: float, n: int, skew: float, kurt: float) -> float:
@@ -251,6 +251,7 @@ def summarize(
     table: pl.DataFrame,
     n_trials: int,
     var_sr_trials: float,
+    slots: int = MAX_POSITIONS,
 ) -> dict:
     """Bundle trade R, curve statistics, exposure and DSR for one variant."""
     r_values = trade_r(trades, table)
@@ -292,7 +293,7 @@ def summarize(
         "cagr": stats["cagr"],
         "sharpe_ann": stats["sharpe_ann"],
         "max_drawdown": stats["max_drawdown"],
-        "exposure": exposure(trades, stats["n_days"]),
+        "exposure": exposure(trades, stats["n_days"], slots),
         "dsr": dsr_value,
     }
     if n_trades == 0:

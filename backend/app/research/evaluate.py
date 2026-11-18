@@ -187,10 +187,14 @@ def equity_frame(result: object) -> pl.DataFrame:
 # ---------------------------------------------------------------------------
 
 
-def _metrics(result: object, table: pl.DataFrame, ctx: EvalContext) -> tuple[dict, pl.DataFrame]:
+def _metrics(
+    result: object, table: pl.DataFrame, ctx: EvalContext, slots: int = 10
+) -> tuple[dict, pl.DataFrame]:
     equity = equity_frame(result)
     trades = getattr(result, "trades", None) or []
-    metrics = summarize(trades, equity, table, ctx.n_trials, ctx.var_sr_trials)
+    metrics = summarize(
+        trades, equity, table, ctx.n_trials, ctx.var_sr_trials, slots=slots
+    )
     # Keep the return moments so the DSR can be recomputed once the final trial
     # count is known (finalize_trials); ctx.n_trials is only provisional.
     stats = curve_stats(equity)
@@ -449,12 +453,12 @@ def evaluate_variant(
     main_result = run_table(
         ctx.svc, table_path, period, MAIN_SLIPPAGE_BPS, max_positions=slots
     )
-    main_metrics, main_equity = _metrics(main_result, table, ctx)
+    main_metrics, main_equity = _metrics(main_result, table, ctx, slots)
 
     stress_result = run_table(
         ctx.svc, table_path, period, STRESS_SLIPPAGE_BPS, max_positions=slots
     )
-    stress_metrics, _stress_equity = _metrics(stress_result, table, ctx)
+    stress_metrics, _stress_equity = _metrics(stress_result, table, ctx, slots)
 
     fold_results: list[dict] = []
     if period.name == "dev":
@@ -463,7 +467,7 @@ def evaluate_variant(
             days = table["date"].unique().sort().to_list()
         for fold in folds(period, list(days)):
             result = run_table(ctx.svc, table_path, fold, max_positions=slots)
-            metrics, _equity = _metrics(result, table, ctx)
+            metrics, _equity = _metrics(result, table, ctx, slots)
             fold_results.append(
                 {
                     "start": fold.start.isoformat(),
