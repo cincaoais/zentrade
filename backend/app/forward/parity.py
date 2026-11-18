@@ -224,6 +224,7 @@ def compare(
     engine_trades: list[dict],
     decisions: dict[date, dict],
     bars_hash_by_date: dict[date, str],
+    degraded_dates: set[date] | frozenset[date] = frozenset(),
 ) -> dict:
     """Compare the night engine's trades with the saved morning decisions.
 
@@ -231,16 +232,21 @@ def compare(
     through ``t``; ``decisions`` maps a decision date to its saved record
     (``{"date", "actions", "input_hash"}``) and ``bars_hash_by_date`` holds the
     current hash of each date's engine input. The result always has the keys
-    ``logic_mismatch``, ``data_revision`` and ``intraday_stops``.
+    ``logic_mismatch``, ``data_revision``, ``degraded_day`` and
+    ``intraday_stops``.
 
     A mismatch on a date whose saved input hash differs from the current hash is
     classified as ``data_revision`` (one entry per date, with the offending
-    mismatch details); every other mismatch is a ``logic_mismatch``. Intraday
-    stops are listed separately and never as mismatches.
+    mismatch details); every other mismatch is a ``logic_mismatch``. A mismatch
+    on a date in ``degraded_dates`` (the morning had no full plan: ``no_plan``,
+    ``missed_open`` or ``no_open``) is recorded under ``degraded_day`` instead:
+    it never halts entries. Intraday stops are listed separately and never as
+    mismatches.
     """
     sells = _sells_by_date(engine_trades)
     buys = _buys_by_date(engine_trades)
     stop_lines = _sell_stop_lines(engine_trades)
+    degraded = {_as_date(day) for day in degraded_dates}
 
     normalized: dict[date, dict] = {}
     for key, record in decisions.items():
@@ -248,6 +254,7 @@ def compare(
 
     logic_mismatch: list[dict] = []
     data_revision: list[dict] = []
+    degraded_day: list[dict] = []
     intraday_stops: list[dict] = []
 
     for day in sorted(normalized):
@@ -256,6 +263,13 @@ def compare(
         actual = sells.get(day, []) + buys.get(day, [])
         mismatches, intraday = _compare_day(day, expected, actual, stop_lines)
         intraday_stops.extend(_stop_dict(action, day) for action in intraday)
+
+        if day in degraded:
+            if mismatches:
+                degraded_day.append(
+                    {"date": day.isoformat(), "mismatches": mismatches}
+                )
+            continue
 
         saved_hash = _field(record, "input_hash", _MISSING)
         current_hash = _hash_for(bars_hash_by_date, day)
@@ -279,6 +293,7 @@ def compare(
     return {
         "logic_mismatch": logic_mismatch,
         "data_revision": data_revision,
+        "degraded_day": degraded_day,
         "intraday_stops": intraday_stops,
     }
 

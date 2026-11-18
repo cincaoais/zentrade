@@ -92,7 +92,12 @@ def test_equal_is_clean() -> None:
 
     result = compare(trades, decisions, hashes)
 
-    assert result == {"logic_mismatch": [], "data_revision": [], "intraday_stops": []}
+    assert result == {
+        "logic_mismatch": [],
+        "data_revision": [],
+        "intraday_stops": [],
+        "degraded_day": [],
+    }
 
 
 def test_shares_difference_is_logic_mismatch() -> None:
@@ -107,6 +112,25 @@ def test_shares_difference_is_logic_mismatch() -> None:
     assert any(
         item["symbol"] == "BBB" and item["field"] == "shares"
         for item in result["logic_mismatch"]
+    )
+
+
+def test_degraded_day_not_logic_mismatch() -> None:
+    day = date(2026, 1, 6)
+    trades, decisions, hashes = _happy_path(day)
+    trades[1]["shares"] = 21
+
+    result = compare(trades, decisions, hashes, degraded_dates={day})
+
+    assert result["logic_mismatch"] == []
+    assert result["data_revision"] == []
+    assert result["intraday_stops"] == []
+    assert len(result["degraded_day"]) == 1
+    degraded = result["degraded_day"][0]
+    assert degraded["date"] == day.isoformat()
+    assert any(
+        item["symbol"] == "BBB" and item["field"] == "shares"
+        for item in degraded["mismatches"]
     )
 
 
