@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import multiprocessing as mp
 import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -364,6 +365,55 @@ def _extend_chan(
 # Wyckoff: nightly full replay with the pinned function
 # ---------------------------------------------------------------------------
 
+def _needs_seed(
+    data_dir: Path,
+    symbol: str,
+    bars: pl.DataFrame,
+    engine_version: str,
+) -> bool:
+    """True when :func:`_extend_chan` will do a full replay instead of extending."""
+    frame = bars.to_pandas().loc[:, list(ENGINE_COLUMNS)]
+    through = _as_date(frame["date"].iloc[-1])
+    state = _read_state(data_dir, symbol)
+    if state is None or state["engine_version"] != engine_version:
+        return True
+    if state["through"] > through:
+        return True
+    if state["bars_seen"] != _bars_through(bars, state["through"]):
+        return True
+    history_changed = changed_symbols(
+        {symbol: state["history_hash"]},
+        {symbol: _hash_through(symbol, bars, state["through"])},
+    )
+    return bool(history_changed)
+
+
+def _picklable(value: object) -> bool:
+    import pickle
+
+    try:
+        pickle.dumps(value)
+    except Exception:
+        return False
+    return True
+
+
+def _process_symbol(task: tuple) -> tuple[str, str, str | None]:
+    """Worker entry point: extend one symbol's Chan state and replay Wyckoff.
+
+    Module-level and argument-only so the ``spawn`` context can pickle it. The
+    parent uses the exact same function for the sequential path.
+    """
+    data_dir, symbol, bars, snapshot_fn, engine_version, port_version = task
+    try:
+        mode = _extend_chan(data_dir, symbol, bars, snapshot_fn, engine_version)
+        _replay_wyckoff(data_dir, symbol, bars, port_version)
+    except Exception as exc:
+        logger.exception("point extension failed for %s", symbol)
+        return symbol, "failed", f"{type(exc).__name__}: {exc}"
+    return symbol, mode, None
+
+
 def _replay_wyckoff(
     data_dir: Path, symbol: str, bars: pl.DataFrame, port_version: str
 ) -> None:
@@ -391,12 +441,18 @@ def extend_points(
 ) -> dict:
     """Bring every symbol's forwarded points to what a fresh replay through t yields.
 
-    ``workers`` is accepted for the caller's interface; symbols are processed
-    sequentially so an injected (possibly unpicklable) ``snapshot_fn`` works and
-    each symbol's state advances atomically.
+    When ``snapshot_fn`` is the default real-engine function and ``workers > 1``,
+    symbols that need a full replay are seeded in a ``spawn`` multiprocessing
+    Pool; each worker calls :func:`_process_symbol`, the same function the
+    sequential path uses. Symbols that can be extended incrementally stay in the
+    parent. A ``snapshot_fn`` that cannot be pickled (a test closure) runs
+    sequentially; a module-level one uses the pool like the real engine.
     """
     data_dir = Path(data_dir)
     snapshot_fn = snapshot_fn if snapshot_fn is not None else _real_snapshot
+    # The pool needs a picklable (module-level) snapshot function; a closure
+    # injected by a test falls back to the sequential path.
+    poolable = int(workers) > 1 and _picklable(snapshot_fn)
     engine_version = chan_engine_version()
     port_version = wyckoff_port_version()
     bars = load_forward_bars(data_dir, symbols=list(symbols), end=t)
@@ -406,22 +462,43 @@ def extend_points(
         "replayed": [],
         "failed": [],
     }
+    pending: list[tuple] = []
     for symbol in sorted(set(symbols)):
         symbol_bars = bars.filter(pl.col("symbol") == symbol).sort("date")
         if symbol_bars.is_empty():
             logger.warning("point extension has no bars for %s through %s", symbol, t)
             result["failed"].append(symbol)
             continue
-        try:
-            mode = _extend_chan(
-                data_dir, symbol, symbol_bars, snapshot_fn, engine_version
-            )
-            _replay_wyckoff(data_dir, symbol, symbol_bars, port_version)
-        except Exception:
-            logger.exception("point extension failed for %s", symbol)
-            result["failed"].append(symbol)
+        task = (
+            data_dir,
+            symbol,
+            symbol_bars,
+            snapshot_fn,
+            engine_version,
+            port_version,
+        )
+        if poolable and _needs_seed(data_dir, symbol, symbol_bars, engine_version):
+            pending.append(task)
             continue
-        result[mode].append(symbol)
+        work_symbol, mode, error = _process_symbol(task)
+        if error is not None:
+            result["failed"].append(work_symbol)
+        else:
+            result[mode].append(work_symbol)
+
+    if pending:
+        context = mp.get_context("spawn")
+        with context.Pool(processes=max(1, min(int(workers), len(pending)))) as pool:
+            for symbol, mode, error in pool.imap_unordered(
+                _process_symbol, pending, chunksize=1
+            ):
+                if error is not None:
+                    result["failed"].append(symbol)
+                else:
+                    result[mode].append(symbol)
+
+    for key in result:
+        result[key] = sorted(result[key])
     return result
 
 def _concat_parts(
