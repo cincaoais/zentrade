@@ -22,6 +22,7 @@ from app.forward.engine_run import Action
 from app.strategy.builtin.research_signal_table import STOP_LOSS
 
 _MISSING = object()
+_OPEN_EXIT_REASONS = frozenset({"max_hold", "signal"})
 
 def _as_date(value: object) -> date:
     if isinstance(value, datetime):
@@ -156,7 +157,7 @@ def _compare_day(
     expected: list[Action],
     actual: list[Action],
     stop_lines: dict[tuple[date, str], float],
-) -> tuple[list[dict], list[Action]]:
+) -> tuple[list[dict], list[Action], list[Action]]:
     """Differences between one day's expected and actual actions.
 
     Returns ``(mismatches, intraday_stops)``. An actual sell with reason
@@ -168,6 +169,7 @@ def _compare_day(
     actual_by_key = {(action.kind, action.symbol): action for action in actual}
     mismatches: list[dict] = []
     intraday: list[Action] = []
+    overridden: list[Action] = []
 
     for key in sorted(set(expected_by_key) | set(actual_by_key)):
         wanted = expected_by_key.get(key)
@@ -188,6 +190,19 @@ def _compare_day(
         if found is None:
             mismatches.append(_mismatch(day, wanted, "action", _action_dict(wanted), None))
             continue
+        if (
+            wanted.kind == "sell"
+            and wanted.reason in _OPEN_EXIT_REASONS
+            and found.reason == "stop_loss"
+            and wanted.shares == found.shares
+            and _at_stop_line(found.price, stop_lines.get((day, found.symbol)))
+        ):
+            # The frozen engine runs risk exits before the scheduled exits at the
+            # open (engine.py:2040-2101), so on the full bar a same-day intraday
+            # stop replaces the open exit the morning sent. Engine ordering, not
+            # a rule mismatch.
+            overridden.append(found)
+            continue
         if wanted.shares != found.shares:
             mismatches.append(
                 _mismatch(day, wanted, "shares", wanted.shares, found.shares)
@@ -201,7 +216,7 @@ def _compare_day(
                 _mismatch(day, wanted, "reason", wanted.reason, found.reason)
             )
 
-    return mismatches, intraday
+    return mismatches, intraday, overridden
 
 def _hash_for(hashes: dict[date, str], day: date) -> str | None:
     if day in hashes:
@@ -256,13 +271,15 @@ def compare(
     data_revision: list[dict] = []
     degraded_day: list[dict] = []
     intraday_stops: list[dict] = []
+    open_exit_vs_intraday_stop: list[dict] = []
 
     for day in sorted(normalized):
         record = normalized[day]
         expected = decision_actions(record)
         actual = sells.get(day, []) + buys.get(day, [])
-        mismatches, intraday = _compare_day(day, expected, actual, stop_lines)
+        mismatches, intraday, overridden = _compare_day(day, expected, actual, stop_lines)
         intraday_stops.extend(_stop_dict(action, day) for action in intraday)
+        open_exit_vs_intraday_stop.extend(_stop_dict(action, day) for action in overridden)
 
         if day in degraded:
             if mismatches:
@@ -295,6 +312,7 @@ def compare(
         "data_revision": data_revision,
         "degraded_day": degraded_day,
         "intraday_stops": intraday_stops,
+        "open_exit_vs_intraday_stop": open_exit_vs_intraday_stop,
     }
 
 __all__ = ["compare", "decision_actions"]

@@ -245,6 +245,54 @@ def _reference_outcomes(
     return Reference(actions=actions, intraday=intraday, total_trades=len(trades))
 
 
+# Open exits the full-bar engine replaces with a same-day intraday stop: it runs
+# its risk exits before the scheduled exits at the open (engine.py:2040-2101).
+_OPEN_EXIT_REASONS = frozenset({"max_hold", "signal"})
+
+
+def compare_actions(
+    collected: Counter,
+    expected: Counter,
+    intraday: list[dict],
+) -> tuple[list[str], list[str]]:
+    """Compare rehearsal actions with the reference; return ``(differences, overridden)``.
+
+    ``overridden`` lists open exits (max hold or exit signal) that the morning
+    procedure sells at the open while the full-bar engine records an intraday
+    stop for the same symbol and day, because the frozen engine checks risk
+    exits first. That is the engine's ordering, not a rule mismatch.
+    """
+    differences: list[str] = []
+    overridden: list[str] = []
+    stops = {(row["symbol"], row["date"].isoformat()) for row in intraday}
+
+    for row in intraday:
+        if not row["low_ok"]:
+            differences.append(
+                "intraday stop without a low through the stop: "
+                f"{row['symbol']} {row['date'].isoformat()} "
+                f"low={row['low']:.4f} stop={row['stop_price']:.4f}"
+            )
+
+    for key in sorted(set(collected) | set(expected)):
+        mine = collected.get(key, 0)
+        theirs = expected.get(key, 0)
+        if mine == theirs:
+            continue
+        symbol, day, kind, shares, reason = key
+        label = f"{kind} {symbol} {day} shares={shares} reason={reason}"
+        if mine < theirs:
+            differences.extend([f"missing {label}"] * (theirs - mine))
+            continue
+        extra = mine - theirs
+        if kind == "sell" and reason in _OPEN_EXIT_REASONS and (symbol, day) in stops:
+            overridden.append(f"{symbol} {day} open {reason} vs intraday stop_loss")
+            extra -= 1
+        differences.extend([f"unexpected {label}"] * extra)
+
+    return differences, overridden
+
+
 def rehearse(
     data_dir: Path,
     variant_id: str,
@@ -381,24 +429,8 @@ def rehearse(
     )
     intraday = [row for row in reference.intraday if row["date"] <= cutoff]
 
-    for row in intraday:
-        if not row["low_ok"]:
-            differences.append(
-                "intraday stop without a low through the stop: "
-                f"{row['symbol']} {row['date'].isoformat()} "
-                f"low={row['low']:.4f} stop={row['stop_price']:.4f}"
-            )
-
-    for key in sorted(set(collected) | set(expected)):
-        mine = collected.get(key, 0)
-        theirs = expected.get(key, 0)
-        if mine == theirs:
-            continue
-        label = f"{key[2]} {key[0]} {key[1]} shares={key[3]} reason={key[4]}"
-        if mine < theirs:
-            differences.extend([f"missing {label}"] * (theirs - mine))
-        else:
-            differences.extend([f"unexpected {label}"] * (mine - theirs))
+    found, overridden = compare_actions(collected, expected, intraday)
+    differences.extend(found)
 
     return {
         "days": days_run,
@@ -406,6 +438,7 @@ def rehearse(
         "rehearsal_trades": sum(collected.values()),
         "differences": differences,
         "intraday_stops": len(intraday),
+        "open_exit_vs_intraday_stop": overridden,
     }
 
 

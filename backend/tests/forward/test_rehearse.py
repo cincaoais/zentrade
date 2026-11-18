@@ -247,3 +247,35 @@ def test_rehearsal_reports_injected_difference(
 
     assert dropped["done"] is True
     assert len(result["differences"]) == 1
+
+def test_open_exit_overridden_by_intraday_stop_is_classified() -> None:
+    # Final-year COIN case: the morning sells at the open for max_hold, while the
+    # full-bar engine checks risk exits first and records a stop at the stop
+    # price on the same day. That is the frozen engine's ordering, not a rule
+    # mismatch, so it is reported apart from differences.
+    from collections import Counter
+
+    from app.forward.rehearse import compare_actions
+
+    collected = Counter({("COIN", "2026-07-31", "sell", 715, "max_hold"): 1})
+    expected: Counter = Counter()
+    intraday = [
+        {"symbol": "COIN", "date": date(2026, 7, 31), "low_ok": True, "low": 139.11, "stop_price": 139.4}
+    ]
+
+    differences, overridden = compare_actions(collected, expected, intraday)
+
+    assert differences == []
+    assert overridden == ["COIN 2026-07-31 open max_hold vs intraday stop_loss"]
+
+
+def test_unexplained_extra_sell_is_still_a_difference() -> None:
+    from collections import Counter
+
+    from app.forward.rehearse import compare_actions
+
+    collected = Counter({("COIN", "2026-07-31", "sell", 715, "max_hold"): 1})
+    differences, overridden = compare_actions(collected, Counter(), [])
+
+    assert differences == ["unexpected sell COIN 2026-07-31 shares=715 reason=max_hold"]
+    assert overridden == []

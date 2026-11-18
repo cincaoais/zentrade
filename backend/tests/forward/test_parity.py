@@ -97,6 +97,7 @@ def test_equal_is_clean() -> None:
         "data_revision": [],
         "intraday_stops": [],
         "degraded_day": [],
+        "open_exit_vs_intraday_stop": [],
     }
 
 
@@ -222,3 +223,27 @@ def test_day_keeps_every_status(tmp_path) -> None:
 
 def test_replay_mismatch_is_a_status(tmp_path) -> None:
     record(tmp_path, "h2s", date(2026, 11, 18), "replay_mismatch", "AAPL differs")
+
+
+def test_open_exit_replaced_by_intraday_stop_is_not_a_mismatch() -> None:
+    # The morning sold at the open for max_hold; the full-bar engine runs its
+    # risk exits first and records a stop at the stop line the same day.
+    day = date(2026, 7, 31)
+    trades = [
+        _trade(
+            "COIN",
+            entry_date="2026-07-02",
+            exit_date=day.isoformat(),
+            shares=715,
+            entry_price=164.0,
+            exit_price=164.0 * 0.85,
+            exit_reason="stop_loss",
+        )
+    ]
+    morning_sell = {**_sell("COIN", 715, 153.1, day.isoformat()), "reason": "max_hold"}
+    decisions = {day: _decision(day, [morning_sell], "h1")}
+
+    result = compare(trades, decisions, {day: "h1"})
+
+    assert result["logic_mismatch"] == []
+    assert [row["symbol"] for row in result["open_exit_vs_intraday_stop"]] == ["COIN"]
