@@ -354,15 +354,19 @@
       ctx.fillStyle = TEXT;
       let header = state.symbol + ' · ' + state.tf;
       if (trade) {
-        const entry = trade.entry_price == null ? '—' : formatPrice(trade.entry_price, span);
+        const stats = _headerStats(trade, iso, count > 0 ? candles.c[count - 1] : null);
+        const entry =
+          stats.status === 'pending' || trade.entry_price == null
+            ? '—'
+            : formatPrice(trade.entry_price, span);
         const exit =
-          trade.exit_date && trade.exit_date <= iso
+          stats.status === 'closed'
             ? trade.exit_price == null
               ? '—'
               : formatPrice(trade.exit_price, span)
-            : 'open';
-        const ret = trade.ret == null ? '—' : ZT.data.fmtPct(trade.ret);
-        const r = trade.r == null ? '—' : Number(trade.r).toFixed(2) + 'R';
+            : stats.status;
+        const ret = stats.ret == null ? '—' : ZT.data.fmtPct(stats.ret);
+        const r = stats.r == null ? '—' : Number(stats.r).toFixed(2) + 'R';
         header += ' · ' + entry + ' → ' + exit + ' · ' + ret + ' · ' + r;
       }
       ctx.fillText(header, padL, 10);
@@ -479,5 +483,27 @@
     };
   }
 
-  ZT.candles = { create: create, _view: _view };
+  // Header numbers as of `iso` (point-in-time). Before the fill nothing is known; while
+  // open, ret and R come from `close` (the last close <= iso); only a closed trade shows
+  // its stored final ret / r. R = (price - entry) / (entry - invalidation).
+  function _headerStats(trade, iso, close) {
+    if (!trade || !trade.entry_date || trade.entry_date > iso) {
+      return { status: 'pending', ret: null, r: null };
+    }
+    if (trade.exit_date && trade.exit_date <= iso) {
+      return { status: 'closed', ret: trade.ret, r: trade.r };
+    }
+    const entry = trade.entry_price;
+    if (entry == null || close == null || !(entry > 0)) {
+      return { status: 'open', ret: null, r: null };
+    }
+    const risk = trade.invalidation == null ? null : entry - trade.invalidation;
+    return {
+      status: 'open',
+      ret: close / entry - 1,
+      r: risk != null && risk > 0 ? (close - entry) / risk : null,
+    };
+  }
+
+  ZT.candles = { create: create, _view: _view, _headerStats: _headerStats };
 })();

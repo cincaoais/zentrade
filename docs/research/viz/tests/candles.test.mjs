@@ -112,3 +112,27 @@ test('_view includes trade legs and invalidation in lo/hi, ignores future legs',
   assert.equal(withTrade.hi, 5000, 'past leg high is included');
   assert.ok(withTrade.hi < 99999, 'leg dated after iso is excluded');
 });
+test('_headerStats is point-in-time: open trade uses close at iso, never the final ret/r', () => {
+  const trade = {
+    entry_date: '2026-06-18', exit_date: '2026-07-20', signal_date: '2026-06-17',
+    entry_price: 20, exit_price: 30, invalidation: 15, ret: 0.5, r: 2,
+  };
+  // before the fill: nothing about the trade's outcome is known
+  const pending = ZT.candles._headerStats(trade, '2026-06-17', 19);
+  assert.equal(pending.status, 'pending');
+  assert.equal(pending.ret, null);
+  assert.equal(pending.r, null);
+  // open: ret and R from the close at iso, not from exit_price
+  const open = ZT.candles._headerStats(trade, '2026-06-24', 22);
+  assert.equal(open.status, 'open');
+  assert.ok(Math.abs(open.ret - 0.1) < 1e-12);
+  assert.ok(Math.abs(open.r - 0.4) < 1e-12);
+  // closed: the stored final values
+  const closed = ZT.candles._headerStats(trade, '2026-07-20', 99);
+  assert.equal(closed.status, 'closed');
+  assert.equal(closed.ret, 0.5);
+  assert.equal(closed.r, 2);
+  // open with no usable risk (invalidation missing or >= entry): R unknown
+  const noRisk = ZT.candles._headerStats({ ...trade, invalidation: null }, '2026-06-24', 22);
+  assert.equal(noRisk.r, null);
+});
