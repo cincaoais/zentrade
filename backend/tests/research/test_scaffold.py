@@ -55,9 +55,15 @@ def test_live_app_never_imports_research() -> None:
     backend_root = Path(__file__).resolve().parents[2]
     app_root = backend_root / "app"
     research_root = app_root / "research"
+    # The forward-test runner (app/forward) exists to run the frozen research
+    # code and is started from its own CLI, never by the web app; the reverse
+    # rule (no live module imports app.forward) is tests/forward/test_isolation.py.
+    forward_root = app_root / "forward"
     offenders = []
     for path in app_root.rglob("*.py"):
         if research_root in path.parents or path == research_root:
+            continue
+        if forward_root in path.parents:
             continue
         text = path.read_text(encoding="utf-8", errors="ignore")
         if "app.research" in text or "from app import research" in text:
