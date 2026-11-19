@@ -3,9 +3,12 @@
 The unchanged research engine decides the day: the real official opens become
 one open-only bar for ``t1`` (plus a pad bar so the engine keeps running), the
 engine runs over the registered window, and its actions dated ``t1`` become
-orders. Sells use this strategy's live lot quantity; buys use the engine's share
-count. Exits always run; entries stop on a missing night plan, a pin mismatch, a
-recorded replay mismatch or a kill flag.
+orders. Sells use this strategy's live lot quantity (capped by the executor at
+the broker's shares); buys use the engine's share count. A live lot the engine
+no longer holds is sold as a catch-up exit. Entries stop on a missing or
+unready night plan, an unacknowledged logic/replay mismatch, or a frozen
+symbol. A pin mismatch stops the whole morning; the kill flag stops every order
+(spec 6.8).
 
 The clock is injected: ``now()`` returns an aware US/Eastern datetime and
 ``sleep`` advances it. Tests use a fake clock and never sleep for real.
@@ -29,14 +32,16 @@ from app.forward.book import (
     LiveBook,
     check_saved_matches_journal,
     save_book,
+    saved_journal_events,
 )
 from app.forward.config import LEADS, forward_dir
 from app.forward.data import load_forward_bars
-from app.forward.days import record, statuses_on
+from app.forward.days import record, rows_for, statuses_on
 from app.forward.engine_run import (
     Action,
     actions_on,
     build_engine_store,
+    engine_holdings,
     next_pad_day,
     open_only_rows,
     run_engine,
@@ -53,6 +58,7 @@ OPEN_DEADLINE = time(9, 35)
 ORDER_DEADLINE = time(10, 0)
 RETRY_DEADLINE = time(10, 5)
 ENTRY_CAP_FRACTION = 1.1
+HOLD_STATUSES = frozenset({"logic_mismatch", "replay_mismatch"})
 
 def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     path = Path(path)
@@ -170,7 +176,7 @@ def _fallback_eligibility(data_dir: Path, t: date, t1: date, pad_day: date) -> p
 def _deadline_seconds(clock: Any, t1: date, at: time) -> float:
     now = clock.now()
     target = datetime.combine(t1, at, tzinfo=now.tzinfo)
-    return float(clock.monotonic() + max(0.0, (target - now).total_seconds()))
+    return float(clock.monotonic() + max(0.0, target.timestamp() - now.timestamp()))
 
 def _poll_opens(
     quotes: Any,
@@ -178,7 +184,12 @@ def _poll_opens(
     t1: date,
     clock: Any,
 ) -> dict[str, float]:
-    """Read official opens from 09:30 until all are present or 09:35."""
+    """Read official opens from 09:30 until all are present or 09:35.
+
+    A snapshot whose ``update_time`` is before 09:30 ET on ``t1`` has not seen
+    today's session yet (its ``open_price`` can still be the previous day's),
+    so it is ignored.
+    """
     wanted = sorted(set(symbols))
     if not wanted:
         return {}
@@ -187,8 +198,9 @@ def _poll_opens(
     open_at = datetime.combine(t1, OPEN_START, tzinfo=now.tzinfo)
     deadline = datetime.combine(t1, OPEN_DEADLINE, tzinfo=now.tzinfo)
     if now < open_at:
-        clock.sleep((open_at - now).total_seconds())
+        clock.sleep(open_at.timestamp() - now.timestamp())
         now = clock.now()
+    session_start = open_at.timestamp()
 
     opens: dict[str, float] = {}
     while True:
@@ -198,7 +210,10 @@ def _poll_opens(
                 continue
             try:
                 price = float(row.get("open_price"))
+                stamp = float(row.get("update_time"))
             except (TypeError, ValueError):
+                continue
+            if not (math.isfinite(stamp) and stamp >= session_start):
                 continue
             if math.isfinite(price) and price > 0:
                 opens[str(symbol)] = price
@@ -207,7 +222,7 @@ def _poll_opens(
         now = clock.now()
         if now >= deadline:
             break
-        remaining = (deadline - now).total_seconds()
+        remaining = deadline.timestamp() - now.timestamp()
         if remaining <= 0:
             break
         before = clock.now()
@@ -340,6 +355,7 @@ def _submit_sells(
     book: LiveBook,
     executor: Executor,
 ) -> set[str]:
+    """Sell each lot named by ``actions``; the executor caps at the broker's shares."""
     attempted: set[str] = set()
     for action in actions:
         lot = book.lots.get(action.symbol)
@@ -347,10 +363,27 @@ def _submit_sells(
             continue
         key = _order_key(short, t1, action.symbol, "S")
         try:
-            executor.submit(key, action.symbol, "S", lot.shares)
+            outcome = executor.submit(key, action.symbol, "S", lot.shares)
         except OrderCapExceeded as exc:
             record(data_dir, short, t1, "no_plan", f"order cap: {exc}")
             continue
+        except Exception as exc:  # one symbol must not stop the other exits
+            record(
+                data_dir,
+                short,
+                t1,
+                "exit_incomplete",
+                f"{action.symbol} sell failed: {type(exc).__name__}: {exc}",
+            )
+            continue
+        if outcome == "skipped":
+            record(
+                data_dir,
+                short,
+                t1,
+                "reconcile_mismatch",
+                f"{action.symbol}: the book holds {lot.shares} but the broker has no unclaimed shares",
+            )
         attempted.add(action.symbol)
     return attempted
 
@@ -399,6 +432,15 @@ def _submit_buys(
         except OrderCapExceeded as exc:
             record(data_dir, short, t1, "no_plan", f"order cap: {exc}")
             continue
+        except Exception as exc:  # one symbol must not stop the other entries
+            record(
+                data_dir,
+                short,
+                t1,
+                "no_plan",
+                f"{action.symbol} buy failed: {type(exc).__name__}: {exc}",
+            )
+            continue
         submitted.append(action)
         open_notional += notional
     return submitted
@@ -441,6 +483,208 @@ def engine_entry_prices(data_dir: Path, short: str) -> dict[str, float]:
     }
 
 
+# ── entry holds ─────────────────────────────────────────────────
+
+
+def _entry_hold(data_dir: Path, short: str, t1: date) -> str | None:
+    """A recorded logic/replay mismatch stops entries until the user acknowledges it.
+
+    The acknowledgement is ``forward/<short>/ack.txt`` holding an ISO date:
+    mismatches recorded on or before that date are cleared (spec 6.7: entries
+    stop "until the user looks").
+    """
+    ack_path = forward_dir(data_dir) / short / "ack.txt"
+    ack: date | None = None
+    if ack_path.is_file():
+        try:
+            ack = date.fromisoformat(ack_path.read_text(encoding="utf-8").strip()[:10])
+        except ValueError:
+            ack = None
+    open_rows = []
+    for row in rows_for(data_dir, short):
+        if row.get("status") not in HOLD_STATUSES:
+            continue
+        try:
+            day = date.fromisoformat(str(row.get("date"))[:10])
+        except ValueError:
+            continue
+        if day < t1 and (ack is None or day > ack):
+            open_rows.append((day, str(row.get("status")), str(row.get("reason", ""))))
+    if not open_rows:
+        return None
+    day, status, reason = max(open_rows)
+    return (
+        f"{status} on {day.isoformat()} ({reason}); entries stay off until "
+        f"forward/{short}/ack.txt holds {day.isoformat()} or later"
+    )
+
+
+def _frozen_symbols(data_dir: Path, t: date) -> set[str]:
+    """Symbols the last reconciliation froze (unexplained broker/book difference)."""
+    frozen: set[str] = set()
+    for short in LEADS.values():
+        path = forward_dir(data_dir) / short / "reconcile" / f"{t.isoformat()}.json"
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        frozen.update(str(symbol) for symbol in payload.get("frozen_symbols") or [])
+    return frozen
+
+
+def _check_saved_book(data_dir: Path, short: str, capital: float, t1: date) -> None:
+    """The saved book must equal a rebuild from the journal events it was saved from."""
+    book_path = forward_dir(data_dir) / short / "book.json"
+    if not book_path.is_file():
+        return
+    events = Journal(forward_dir(data_dir) / short / "orders.jsonl").events()
+    count = saved_journal_events(book_path)
+    if count is not None:
+        events = events[:count]
+    rebuilt = LiveBook.from_journal(short, capital, events)
+    if not check_saved_matches_journal(book_path, rebuilt):
+        record(
+            data_dir,
+            short,
+            t1,
+            "reconcile_mismatch",
+            "saved book.json differs from a rebuild of the order journal",
+        )
+
+
+# ── decision ────────────────────────────────────────────────────
+
+
+def _decide(
+    data_dir: Path,
+    lead: str,
+    short: str,
+    *,
+    reg: dict,
+    start: date,
+    t: date,
+    t1: date,
+    pad_day: date,
+    book: LiveBook,
+    night: dict | None,
+    night_elig: pl.DataFrame | None,
+    opens: dict[str, float],
+    pins: dict,
+) -> dict[str, Any]:
+    """Run the engine for one strategy and save its decision record."""
+    capital = _capital(reg, lead)
+    held = set(book.lots)
+    ready = bool(night and night.get("ready"))
+    candidates = list(night.get("candidates") or []) if (night and ready) else []
+
+    planned = set(held) | set(candidates)
+    for symbol in sorted(planned - set(opens)):
+        record(data_dir, short, t1, "no_open", f"{symbol} had no open by 09:35")
+
+    buy_block: str | None = None
+    if night is None:
+        buy_block = f"no night record for {t.isoformat()}"
+    elif not ready:
+        buy_block = str(night.get("reason") or "night was not ready")
+    elif night_elig is None:
+        buy_block = f"no eligibility file for {t.isoformat()}"
+    else:
+        buy_block = _entry_hold(data_dir, short, t1)
+    if buy_block is not None:
+        record(data_dir, short, t1, "no_plan", buy_block)
+
+    symbols = set(held) | set(opens)
+    if night:
+        symbols.update(night.get("relevant_symbols") or [])
+        symbols.update(candidates)
+
+    table, extra = _compose(
+        data_dir, lead, t, t1, pad_day, night_elig, sorted(symbols), opens
+    )
+    engine_held: set[str] | None = None
+    if table.is_empty() or not symbols:
+        actions: list[Action] = []
+        engine_equity = float(capital)
+    else:
+        store_symbols = sorted(symbols | set(table["symbol"].to_list()) | set(opens))
+        with tempfile.TemporaryDirectory(prefix=f"forward-morning-{short}-") as work:
+            store = build_engine_store(
+                data_dir,
+                Path(work) / "store",
+                store_symbols,
+                start - timedelta(days=WARMUP_DAYS),
+                pad_day,
+                extra,
+            )
+            engine_result = run_engine(store, table, start, pad_day, capital)
+        actions = review(actions_on(engine_result, t1))
+        engine_equity = _engine_equity(engine_result, capital)
+        engine_held = engine_holdings(engine_result, t1)
+
+    # A live lot the engine no longer holds (a failed exit, a missed stop, a
+    # late morning): the engine sold it in its own run and no action will ever
+    # name it again, so it is sold now.
+    catch_up: list[Action] = []
+    if engine_held is not None:
+        sold = {action.symbol for action in actions if action.kind == "sell"}
+        for symbol, lot in sorted(book.lots.items()):
+            if symbol in engine_held or symbol in sold or lot.entry_date >= t1:
+                continue
+            catch_up.append(
+                Action(
+                    kind="sell",
+                    symbol=symbol,
+                    shares=int(lot.shares),
+                    price=float(opens.get(symbol, 0.0)),
+                    reason="catch_up",
+                    signal_date="",
+                )
+            )
+    if catch_up:
+        names = ", ".join(action.symbol for action in catch_up)
+        record(
+            data_dir,
+            short,
+            t1,
+            "exit_delayed",
+            f"catch-up sell of {names}: the engine no longer holds them",
+        )
+
+    decision = {
+        "date": t1.isoformat(),
+        "short": short,
+        "actions": [_action_dict(action) for action in actions],
+        "catch_up": [_action_dict(action) for action in catch_up],
+        "input_hash": (
+            str(night.get("table_hash"))
+            if night and night.get("table_hash")
+            else _table_hash(table)
+        ),
+        "opens": opens,
+        "engine_equity": engine_equity,
+        "pins": pins,
+    }
+    decision_path = forward_dir(data_dir) / short / "decision" / f"{t1.isoformat()}.json"
+    _atomic_json(decision_path, decision)
+    return {
+        "capital": capital,
+        "book": book,
+        "actions": actions,
+        "catch_up": catch_up,
+        "buy_block": buy_block,
+        "engine_equity": engine_equity,
+        "result": {
+            "decision": str(decision_path),
+            "actions": len(actions),
+            "catch_up": len(catch_up),
+            "orders": {},
+            "engine_equity": engine_equity,
+        },
+    }
+
+
 def run_morning(
     data_dir: Path,
     t1: date,
@@ -452,7 +696,13 @@ def run_morning(
     dry_run: bool,
     repo_root: Path,
 ) -> dict[str, Any]:
-    """Decide and (unless ``dry_run``) execute the morning of ``t1``."""
+    """Decide and (unless ``dry_run``) execute the morning of ``t1``.
+
+    Both strategies are decided first, then the 10:00 deadline is checked once,
+    every order of both strategies is sent, and only then are they polled, so a
+    slow first strategy never pushes the second past the deadline. One
+    strategy's failure is recorded and does not stop the other.
+    """
     data_dir = Path(data_dir)
     reg = load_registration(data_dir)
     require_pins(reg, repo_root, data_dir)
@@ -460,6 +710,49 @@ def run_morning(
     start = date.fromisoformat(str(reg["start_date"])[:10])
     t = us_clock.previous_trading_day(t1)
     pad_day = next_pad_day(t1)
+    stop_path = forward_dir(data_dir) / "STOP"
+
+    result: dict[str, Any] = {
+        "date": t1.isoformat(),
+        "night_date": t.isoformat(),
+        "dry_run": bool(dry_run),
+        "strategies": {},
+    }
+
+    journals = {
+        short: Journal(forward_dir(data_dir) / short / "orders.jsonl")
+        for short in LEADS.values()
+    }
+    executors: dict[str, Any] = (
+        {}
+        if dry_run
+        else {
+            short: executor_factory(broker, journals[short], clock=clock)
+            for short in LEADS.values()
+        }
+    )
+
+    for lead, short in LEADS.items():
+        _check_saved_book(data_dir, short, _capital(reg, lead), t1)
+
+    # Orders an earlier day left open (crash, late restart, unpolled stop).
+    for short, executor in executors.items():
+        resolver = getattr(executor, "resolve_stale", None)
+        if not callable(resolver):
+            continue
+        try:
+            settled = resolver(t1)
+        except Exception as exc:
+            record(
+                data_dir,
+                short,
+                t1,
+                "reconcile_mismatch",
+                f"order history unreadable: {type(exc).__name__}: {exc}",
+            )
+            continue
+        if settled:
+            result.setdefault("settled", {})[short] = settled
 
     books = _held_books(data_dir, reg)
     nights = {short: _night_record(data_dir, short, t) for short in books}
@@ -473,159 +766,130 @@ def run_morning(
             if nights[short].get("ready"):
                 wanted.update(nights[short].get("candidates") or [])
     opens = _poll_opens(quotes, sorted(wanted), t1, clock)
-    now = clock.now()
-    after_order_deadline = now.time() >= ORDER_DEADLINE
-    stop_path = forward_dir(data_dir) / "STOP"
+    frozen = _frozen_symbols(data_dir, t)
 
-    result: dict[str, Any] = {
-        "date": t1.isoformat(),
-        "night_date": t.isoformat(),
-        "dry_run": bool(dry_run),
-        "strategies": {},
-    }
-
+    plans: dict[str, dict[str, Any]] = {}
     for lead, short in LEADS.items():
-        capital = _capital(reg, lead)
-        book = books[short]
-        held = set(book.lots)
-        night = nights.get(short)
-        ready = bool(night and night.get("ready"))
-        candidates = list(night.get("candidates") or []) if ready else []
-
-        planned = set(held) | set(candidates)
-        for symbol in sorted(planned - set(opens)):
-            record(data_dir, short, t1, "no_open", f"{symbol} had no open by 09:35")
-
-        buy_block: str | None = None
-        if night is None:
-            buy_block = f"no night record for {t.isoformat()}"
-            record(data_dir, short, t1, "no_plan", buy_block)
-        elif not ready:
-            buy_block = str(night.get("reason") or "night was not ready")
-            record(data_dir, short, t1, "no_plan", buy_block)
-        elif night_elig is None:
-            buy_block = f"no eligibility file for {t.isoformat()}"
-            record(data_dir, short, t1, "no_plan", buy_block)
-        elif "replay_mismatch" in statuses_on(data_dir, short, t):
-            buy_block = "weekly replay_mismatch"
-            record(data_dir, short, t1, "no_plan", buy_block)
-
-        symbols = set(held) | set(opens)
-        if night:
-            symbols.update(night.get("relevant_symbols") or [])
-            symbols.update(candidates)
-
-        table, extra = _compose(
-            data_dir, lead, t, t1, pad_day, night_elig, sorted(symbols), opens
-        )
-        if table.is_empty() or not symbols:
-            actions: list[Action] = []
-            engine_equity = float(capital)
-        else:
-            store_symbols = sorted(
-                symbols | set(table["symbol"].to_list()) | set(opens)
+        try:
+            plans[short] = _decide(
+                data_dir,
+                lead,
+                short,
+                reg=reg,
+                start=start,
+                t=t,
+                t1=t1,
+                pad_day=pad_day,
+                book=books[short],
+                night=nights.get(short),
+                night_elig=night_elig,
+                opens=opens,
+                pins=pins,
             )
-            with tempfile.TemporaryDirectory(prefix=f"forward-morning-{short}-") as work:
-                store = build_engine_store(
-                    data_dir,
-                    Path(work) / "store",
-                    store_symbols,
-                    start - timedelta(days=WARMUP_DAYS),
-                    pad_day,
-                    extra,
-                )
-                engine_result = run_engine(store, table, start, pad_day, capital)
-            actions = review(actions_on(engine_result, t1))
-            engine_equity = _engine_equity(engine_result, capital)
+        except Exception as exc:  # the other strategy still trades
+            reason = f"decision failed: {type(exc).__name__}: {exc}"
+            record(data_dir, short, t1, "no_plan", reason)
+            result["strategies"][short] = {"error": reason}
 
-        decision = {
-            "date": t1.isoformat(),
-            "short": short,
-            "actions": [_action_dict(action) for action in actions],
-            "input_hash": (
-                str(night.get("table_hash"))
-                if night and night.get("table_hash")
-                else _table_hash(table)
-            ),
-            "opens": opens,
-            "engine_equity": engine_equity,
-            "pins": pins,
-        }
-        decision_path = (
-            forward_dir(data_dir) / short / "decision" / f"{t1.isoformat()}.json"
-        )
-        _atomic_json(decision_path, decision)
-
-        sells = [action for action in actions if action.kind == "sell"]
+    after_order_deadline = clock.now().time() >= ORDER_DEADLINE
+    attempted_sells: dict[str, set[str]] = {}
+    for short, plan in plans.items():
+        strategy_result = plan["result"]
+        result["strategies"][short] = strategy_result
+        actions = plan["actions"]
+        sells = [action for action in actions if action.kind == "sell"] + plan["catch_up"]
         buys = [action for action in actions if action.kind == "buy"]
-        strategy_result: dict[str, Any] = {
-            "decision": str(decision_path),
-            "actions": len(actions),
-            "orders": {},
-            "engine_equity": engine_equity,
-        }
 
         if dry_run:
             strategy_result["sent"] = "dry_run"
-        elif stop_path.exists():
+            continue
+        if stop_path.exists():
             record(data_dir, short, t1, "no_plan", "kill flag present")
             strategy_result["sent"] = "kill_flag"
-        elif after_order_deadline:
+            continue
+        executor = executors[short]
+        if after_order_deadline:
             if buys:
                 record(data_dir, short, t1, "missed_open", "M3 started after 10:00")
             if sells:
                 record(data_dir, short, t1, "exit_delayed", "M3 started after 10:00")
-            strategy_result["sent"] = "after_deadline"
-        else:
-            if buy_block is not None:
-                buys = []
-            journal = Journal(forward_dir(data_dir) / short / "orders.jsonl")
-            executor = executor_factory(broker, journal, clock=clock)
-            attempted_sells = _submit_sells(
-                data_dir, short, t1, sells, book, executor
-            ) if sells else set()
-            _submit_buys(
-                data_dir,
-                short,
-                t1,
-                buys,
-                book,
-                executor,
-                engine_equity=engine_equity,
-                opens=opens,
-            ) if buys else []
-
-            if sells or buys:
-                executor.poll_until(_deadline_seconds(clock, t1, ORDER_DEADLINE))
-                executor.poll_until(_deadline_seconds(clock, t1, RETRY_DEADLINE))
-
-            book = LiveBook.from_journal(short, capital, journal.events())
-            book_path = forward_dir(data_dir) / short / "book.json"
-            save_book(book_path, book)
-            saved_matches = check_saved_matches_journal(book_path, book)
-            if not saved_matches:
+            try:
+                # Settle (and cancel) today's orders an earlier run left open.
+                executor.poll_until(clock.monotonic())
+            except Exception as exc:
                 record(
                     data_dir,
                     short,
                     t1,
                     "reconcile_mismatch",
-                    "saved book does not match the order journal",
+                    f"settling today's orders failed: {type(exc).__name__}: {exc}",
                 )
-            for symbol in sorted(attempted_sells):
-                if symbol in book.lots:
-                    record(
-                        data_dir,
-                        short,
-                        t1,
-                        "exit_incomplete",
-                        f"{symbol} still holds {book.lots[symbol].shares} shares",
-                    )
-            strategy_result["sent"] = "live"
-            strategy_result["book"] = str(book_path)
+            strategy_result["sent"] = "after_deadline"
+            continue
 
+        if plan["buy_block"] is not None:
+            buys = []
+        blocked = sorted({action.symbol for action in buys} & frozen)
+        if blocked:
+            record(
+                data_dir,
+                short,
+                t1,
+                "no_plan",
+                f"frozen after a reconcile difference on {t.isoformat()}: {', '.join(blocked)}",
+            )
+            buys = [action for action in buys if action.symbol not in frozen]
+        attempted_sells[short] = (
+            _submit_sells(data_dir, short, t1, sells, plan["book"], executor)
+            if sells
+            else set()
+        )
+        if buys:
+            _submit_buys(
+                data_dir,
+                short,
+                t1,
+                buys,
+                plan["book"],
+                executor,
+                engine_equity=plan["engine_equity"],
+                opens=opens,
+            )
+        strategy_result["sent"] = "live"
+
+    for at in (ORDER_DEADLINE, RETRY_DEADLINE):
+        for short in attempted_sells:
+            try:
+                executors[short].poll_until(_deadline_seconds(clock, t1, at))
+            except Exception as exc:
+                record(
+                    data_dir,
+                    short,
+                    t1,
+                    "reconcile_mismatch",
+                    f"order polling failed: {type(exc).__name__}: {exc}",
+                )
+
+    for short, attempted in attempted_sells.items():
+        plan = plans[short]
+        events = journals[short].events()
+        book = LiveBook.from_journal(short, plan["capital"], events)
+        book_path = forward_dir(data_dir) / short / "book.json"
+        save_book(book_path, book, journal_events=len(events))
+        for symbol in sorted(attempted):
+            if symbol in book.lots:
+                record(
+                    data_dir,
+                    short,
+                    t1,
+                    "exit_incomplete",
+                    f"{symbol} still holds {book.lots[symbol].shares} shares",
+                )
+        plan["result"]["book"] = str(book_path)
+
+    for short in plans:
         if not statuses_on(data_dir, short, t1):
             record(data_dir, short, t1, "ok", "dry_run" if dry_run else "")
-        result["strategies"][short] = strategy_result
 
     return result
 

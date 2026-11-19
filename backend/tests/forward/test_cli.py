@@ -7,11 +7,14 @@ a tiny local fake and all records live under ``tmp_path``. No OpenD, no network.
 from __future__ import annotations
 
 import json
+import os
 import statistics
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from zoneinfo import ZoneInfo
 
+import psutil
 import pytest
 
 from app.forward import cli_support, config
@@ -305,3 +308,174 @@ def test_status_with_explicit_account_id_needs_no_registration(tmp_path) -> None
     assert made == [7]
     assert result["cash"] == 1_000_000.0
     assert not ctx.calls_named("place_order")
+
+
+# ── runner lock ────────────────────────────────────────────────
+def test_acquire_runner_lock_raises_if_held(tmp_path: Path) -> None:
+    with (
+        cli_support.acquire_runner_lock(tmp_path),
+        pytest.raises(RuntimeError) as exc_info,
+        cli_support.acquire_runner_lock(tmp_path),
+    ):
+        pass
+    assert "another forward runner is running" in str(exc_info.value)
+    assert f"pid {os.getpid()}" in str(exc_info.value)
+
+
+def test_acquire_runner_lock_replaces_dead_pid(tmp_path: Path) -> None:
+    lock_file = tmp_path / "forward" / "runner.lock"
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    dead_pid = max(psutil.pids()) + 100_000
+    lock_file.write_text(
+        json.dumps({"pid": dead_pid, "started": "2026-11-19T00:00:00Z"}),
+        encoding="utf-8",
+    )
+
+    with cli_support.acquire_runner_lock(tmp_path):
+        payload = json.loads(lock_file.read_text(encoding="utf-8"))
+        assert payload["pid"] == os.getpid()
+
+    assert not lock_file.exists()
+
+
+def test_acquire_runner_lock_file_gone_after_release(tmp_path: Path) -> None:
+    lock_file = tmp_path / "forward" / "runner.lock"
+    with cli_support.acquire_runner_lock(tmp_path):
+        assert lock_file.exists()
+    assert not lock_file.exists()
+
+
+# ── morning refuses non-trading day ────────────────────────────
+def test_morning_refuses_non_trading_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.forward import run as cli
+
+    class WeekendClock:
+        def today(self) -> date:
+            return date(2026, 11, 21)  # Saturday
+
+        def is_trading_day(self, d: date) -> bool:
+            return False
+
+    broker_created = False
+
+    def spy_make_broker(account_id: int):
+        nonlocal broker_created
+        broker_created = True
+        raise AssertionError("broker must not be created on non-trading day")
+
+    monkeypatch.setattr(cli, "us_clock", WeekendClock())
+    monkeypatch.setattr(cli.cli_support, "make_broker", spy_make_broker)
+
+    with pytest.raises(SystemExit) as exc_info:
+        cli._morning(tmp_path)
+
+    assert "not a trading day" in str(exc_info.value).lower()
+    assert not broker_created
+
+
+# ── broker close in status and flatten ─────────────────────────
+class ClosableFakeBroker:
+    def __init__(self) -> None:
+        self.account_id = 123456
+        self.closed = 0
+
+    def positions(self) -> dict[str, int]:
+        return {}
+
+    def cash(self) -> float:
+        return 1_000_000.0
+
+    def orders_today(self) -> list[dict]:
+        return []
+
+    def check_account(self) -> dict[str, Any]:
+        return {"acc_id": 123456, "trd_env": "SIMULATE"}
+
+    def close(self) -> None:
+        self.closed += 1
+
+
+def test_run_status_closes_broker_only_when_created(tmp_path: Path) -> None:
+    fake_created = ClosableFakeBroker()
+    cli_support.run_status(
+        tmp_path,
+        check_account=True,
+        account_id=123456,
+        broker_factory=lambda acc_id: fake_created,
+    )
+    assert fake_created.closed == 1
+
+    fake_injected = ClosableFakeBroker()
+    cli_support.run_status(
+        tmp_path,
+        check_account=True,
+        broker=fake_injected,
+    )
+    assert fake_injected.closed == 0
+
+
+def test_run_flatten_closes_broker_only_when_created(tmp_path: Path) -> None:
+    fake_created = ClosableFakeBroker()
+    cli_support.run_flatten(
+        tmp_path,
+        confirm=False,
+        account_id=123456,
+        broker_factory=lambda acc_id: fake_created,
+    )
+    assert fake_created.closed == 1
+
+    fake_injected = ClosableFakeBroker()
+    cli_support.run_flatten(
+        tmp_path,
+        confirm=False,
+        broker=fake_injected,
+    )
+    assert fake_injected.closed == 0
+
+
+def test_status_cli_prints_payload_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from scripts.forward import run as cli
+
+    fake_broker = ClosableFakeBroker()
+    monkeypatch.setattr(cli.cli_support, "make_broker", lambda acc_id: fake_broker)
+
+    cli.main(["status", "--data-dir", str(tmp_path), "--check-account", "--account-id", "123456"])
+    out = capsys.readouterr().out
+    assert out.count('"acc_id": 123456') == 1
+
+
+
+
+def test_ack_writes_the_acknowledged_date(tmp_path: Path) -> None:
+    from app.forward.days import record
+    from app.forward.morning import _entry_hold
+
+    record(tmp_path, "h2s", date(2026, 11, 18), "logic_mismatch", "S03 shares differ")
+    assert _entry_hold(tmp_path, "h2s", date(2026, 11, 20)) is not None
+
+    path = cli_support.run_ack(tmp_path, short="h2s", through=date(2026, 11, 18), note="looked")
+
+    assert path == tmp_path / "forward" / "h2s" / "ack.txt"
+    assert _entry_hold(tmp_path, "h2s", date(2026, 11, 20)) is None
+    audit = tmp_path / "forward" / "audit.jsonl"
+    events = [json.loads(line) for line in audit.read_text(encoding="utf-8").splitlines()]
+    assert any(e.get("event") == "ack" and e.get("short") == "h2s" for e in events)
+
+
+def test_ack_rejects_unknown_strategy(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        cli_support.run_ack(tmp_path, short="nope", through=date(2026, 11, 18))
+
+
+def test_runner_lock_message_names_the_file(tmp_path: Path) -> None:
+    with (
+        cli_support.acquire_runner_lock(tmp_path) as path,
+        pytest.raises(RuntimeError) as info,
+        cli_support.acquire_runner_lock(tmp_path),
+    ):
+        pass
+    assert str(path) in str(info.value)

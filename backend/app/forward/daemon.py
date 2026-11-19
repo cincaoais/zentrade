@@ -23,7 +23,12 @@ from typing import Any
 from app.forward import registration
 from app.forward.book import LiveBook, reconcile
 from app.forward.broker import Quotes, SimBroker
-from app.forward.cli_support import SystemClock, append_audit, default_workers
+from app.forward.cli_support import (
+    SystemClock,
+    acquire_runner_lock,
+    append_audit,
+    default_workers,
+)
 from app.forward.config import LEADS, forward_dir
 from app.forward.days import record
 from app.forward.morning import engine_entry_prices, run_morning
@@ -39,6 +44,8 @@ WAKE_BEFORE_OPEN = time(9, 25)
 SESSION_CLOSE = time(16, 0)
 RECONCILE_AT = time(16, 15)
 NIGHT_AT = time(18, 0)
+NIGHT_RETRY_S = 1800
+NIGHT_DEADLINE = time(7, 0)
 
 __all__ = ["reconcile_books", "run"]
 
@@ -172,14 +179,15 @@ def _at(day: date, clock_time: time, tzinfo: Any) -> datetime:
 def _sleep_until(clock: Any, target: datetime) -> None:
     while True:
         now = clock.now()
-        remaining = (target - now).total_seconds()
+        remaining = target.timestamp() - now.timestamp()
         if remaining <= 0:
             return
+        chunk = min(remaining, 300.0)
         sleeper = getattr(clock, "sleep", None)
         if callable(sleeper):
-            sleeper(remaining)
+            sleeper(chunk)
         else:
-            _time.sleep(max(0.0, float(remaining)))
+            _time.sleep(max(0.0, float(chunk)))
 
 
 def _next_trading_day(day: date) -> date:
@@ -289,8 +297,15 @@ def _run_day(
             engine_entry_prices=prices,
             clock=clock,
             dry_run=dry_run,
+            stop_flag=forward_dir(data_dir) / "STOP",
         )
         stopwatch.run_until(_at(day, SESSION_CLOSE, tzinfo))
+        errors = list(getattr(stopwatch, "errors", None) or [])
+        if errors:
+            # Ticks failed: a stop may have been missed while quotes were down.
+            reason = f"{len(errors)} stop-watch error(s); first: {errors[0]}"
+            for short in LEADS.values():
+                record(data_dir, short, day, "stop_missed", reason)
 
     _step(data_dir, day, "stopwatch", watch, "stop_missed")
 
@@ -304,18 +319,28 @@ def _run_day(
     )
 
     _sleep_until(clock, _at(day, NIGHT_AT, tzinfo))
-    _step(
-        data_dir,
-        day,
-        "night",
-        lambda: run_night(
+    deadline = _at(_next_trading_day(day), NIGHT_DEADLINE, tzinfo)
+    while True:
+        result = _step(
             data_dir,
             day,
-            repo_root=repo_root,
-            workers=default_workers(),
-        ),
-        "no_plan",
-    )
+            "night",
+            lambda: run_night(
+                data_dir,
+                day,
+                repo_root=repo_root,
+                workers=default_workers(),
+            ),
+            "no_plan",
+        )
+        if isinstance(result, dict) and result.get("ready"):
+            break
+        next_target = datetime.fromtimestamp(
+            clock.now().timestamp() + NIGHT_RETRY_S, tz=tzinfo
+        )
+        if next_target.timestamp() >= deadline.timestamp():
+            break
+        _sleep_until(clock, next_target)
 
 
 def run(
@@ -336,46 +361,56 @@ def run(
 
     reg = registration.load_registration(data_dir)
     account_id = int(reg["account_id"])
-    append_audit(data_dir, {"event": "start", "dry_run": bool(dry_run)})
 
-    stopped = False
-    try:
-        while True:
-            now = clock.now()
-            day = now.date()
-            tzinfo = now.tzinfo
+    with acquire_runner_lock(data_dir):
+        # Spec 6.8: the registered account must be SIMULATE before any session.
+        checker = broker_factory(account_id)
+        try:
+            check = getattr(checker, "check_account", None)
+            if callable(check):
+                check()
+        finally:
+            _close(checker)
+        append_audit(data_dir, {"event": "start", "dry_run": bool(dry_run)})
 
-            if not us_clock.is_trading_day(day):
+        stopped = False
+        try:
+            while True:
+                now = clock.now()
+                day = now.date()
+                tzinfo = now.tzinfo
+
+                if not us_clock.is_trading_day(day):
+                    _sleep_until(clock, _at(_next_trading_day(day), WAKE_BEFORE_OPEN, tzinfo))
+                    continue
+
+                if now.time() < WAKE_BEFORE_OPEN:
+                    _sleep_until(clock, _at(day, WAKE_BEFORE_OPEN, tzinfo))
+                    continue
+
+                broker = broker_factory(account_id)
+                quotes = quotes_factory()
+                try:
+                    _run_day(
+                        data_dir,
+                        day,
+                        dry_run=dry_run,
+                        repo_root=repo_root,
+                        clock=clock,
+                        broker=broker,
+                        quotes=quotes,
+                        reg=reg,
+                    )
+                finally:
+                    _close(quotes)
+                    _close(broker)
+
                 _sleep_until(clock, _at(_next_trading_day(day), WAKE_BEFORE_OPEN, tzinfo))
-                continue
+        except KeyboardInterrupt:
+            stopped = True
+            append_audit(data_dir, {"event": "stop", "reason": "keyboard_interrupt"})
+        finally:
+            if not stopped:
+                append_audit(data_dir, {"event": "stop", "reason": "exit"})
 
-            if now.time() < WAKE_BEFORE_OPEN:
-                _sleep_until(clock, _at(day, WAKE_BEFORE_OPEN, tzinfo))
-                continue
-
-            broker = broker_factory(account_id)
-            quotes = quotes_factory()
-            try:
-                _run_day(
-                    data_dir,
-                    day,
-                    dry_run=dry_run,
-                    repo_root=repo_root,
-                    clock=clock,
-                    broker=broker,
-                    quotes=quotes,
-                    reg=reg,
-                )
-            finally:
-                _close(quotes)
-                _close(broker)
-
-            _sleep_until(clock, _at(_next_trading_day(day), WAKE_BEFORE_OPEN, tzinfo))
-    except KeyboardInterrupt:
-        stopped = True
-        append_audit(data_dir, {"event": "stop", "reason": "keyboard_interrupt"})
-    finally:
-        if not stopped:
-            append_audit(data_dir, {"event": "stop", "reason": "exit"})
-
-    return {"audit": str(forward_dir(data_dir) / "audit.jsonl"), "stopped": stopped}
+        return {"audit": str(forward_dir(data_dir) / "audit.jsonl"), "stopped": stopped}

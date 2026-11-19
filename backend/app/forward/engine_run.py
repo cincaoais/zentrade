@@ -193,13 +193,23 @@ def build_engine_store(
     dst = Path(dst)
     wanted = [str(symbol) for symbol in symbols]
 
-    glob = str(src / "kline_daily_enriched" / "date=*" / "part.parquet")
-    bars = (
-        pl.scan_parquet(glob, hive_partitioning=False)
-        .filter(pl.col("symbol").is_in(wanted))
-        .filter((pl.col("date") >= start) & (pl.col("date") <= end))
-        .collect()
-        .sort(["symbol", "date"])
+    frames: list[pl.DataFrame] = []
+    # The main store first; the runner's own copy (``forward/bars``, written by
+    # ``preserve_bars`` for held symbols) fills what the daily pipeline pruned.
+    for root in (src / "kline_daily_enriched", src / "forward" / "bars"):
+        if not any(root.glob("date=*/part.parquet")):
+            continue
+        frames.append(
+            pl.scan_parquet(str(root / "date=*" / "part.parquet"), hive_partitioning=False)
+            .filter(pl.col("symbol").is_in(wanted))
+            .filter((pl.col("date") >= start) & (pl.col("date") <= end))
+            .collect()
+        )
+    if not frames:
+        raise FileNotFoundError(f"no daily bars under {src}")
+    bars = frames[0] if len(frames) == 1 else pl.concat(frames, how="diagonal_relaxed")
+    bars = bars.unique(subset=["symbol", "date"], keep="first", maintain_order=True).sort(
+        ["symbol", "date"]
     )
 
     if extra_rows is not None and not extra_rows.is_empty():
@@ -375,6 +385,25 @@ def actions_on(result: object, t1: date) -> list[Action]:
     return sells + buys
 
 
+def engine_holdings(result: object, t1: date) -> set[str]:
+    """Symbols the engine still holds after the session of ``t1``.
+
+    A trade entered on or before ``t1`` that exits after it, or is only closed
+    by the run's final ``end`` sale, is held. A position the engine could never
+    sell (a stock that stopped trading) is not in ``trades`` at all, so it is
+    not reported here either.
+    """
+    target = t1.isoformat()
+    held: set[str] = set()
+    for trade in getattr(result, "trades", None) or []:
+        entry = _date_text(_field(trade, "entry_date"))
+        exit_ = _date_text(_field(trade, "exit_date"))
+        reason = str(_field(trade, "exit_reason", ""))
+        if entry and entry <= target and (not exit_ or exit_ > target or reason == "end"):
+            held.add(str(_field(trade, "symbol", "")))
+    return held
+
+
 def relevant_symbols(
     table: pl.DataFrame, start: date, held: set[str], candidates: list[str]
 ) -> list[str]:
@@ -395,6 +424,7 @@ __all__ = [
     "build_engine_store",
     "build_service",
     "engine_config",
+    "engine_holdings",
     "next_pad_day",
     "open_only_rows",
     "relevant_symbols",

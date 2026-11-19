@@ -91,6 +91,11 @@ def build_parser() -> argparse.ArgumentParser:
     parity = add("parity", "recompute one night's parity record")
     parity.add_argument("--date", required=True)
 
+    ack = add("ack", "acknowledge recorded logic/replay mismatches so entries resume")
+    ack.add_argument("--short", required=True, choices=sorted(LEADS.values()))
+    ack.add_argument("--through", required=True, help="last mismatch date looked at (YYYY-MM-DD)")
+    ack.add_argument("--note", default="")
+
     stop = add("stop", "write the forward/STOP kill flag")
     stop.add_argument("--reason", default="")
 
@@ -143,33 +148,38 @@ def _run_parity(data_dir: Path, day: date) -> dict:
 
 
 def _morning(data_dir: Path) -> dict:
-    from app.forward.morning import run_morning
-    from app.forward.orders import Executor
+    today = us_clock.today()
+    if not us_clock.is_trading_day(today):
+        raise SystemExit(f"{today.isoformat()} is not a trading day")
 
-    reg = registration.load_registration(data_dir)
-    broker = cli_support.make_broker(int(reg["account_id"]))
-    quotes = cli_support.make_quotes()
-    clock = cli_support.SystemClock()
+    with cli_support.acquire_runner_lock(data_dir):
+        from app.forward.morning import run_morning
+        from app.forward.orders import Executor
 
-    def executor_factory(broker_arg, journal_arg, *, clock):
-        return Executor(broker_arg, journal_arg, clock=clock)
+        reg = registration.load_registration(data_dir)
+        broker = cli_support.make_broker(int(reg["account_id"]))
+        quotes = cli_support.make_quotes()
+        clock = cli_support.SystemClock()
 
-    try:
-        return run_morning(
-            data_dir,
-            us_clock.today(),
-            broker=broker,
-            quotes=quotes,
-            executor_factory=executor_factory,
-            clock=clock,
-            dry_run=False,
-            repo_root=REPO_ROOT,
-        )
-    finally:
-        for resource in (quotes, broker):
-            close = getattr(resource, "close", None)
-            if callable(close):
-                close()
+        def executor_factory(broker_arg, journal_arg, *, clock):
+            return Executor(broker_arg, journal_arg, clock=clock)
+
+        try:
+            return run_morning(
+                data_dir,
+                today,
+                broker=broker,
+                quotes=quotes,
+                executor_factory=executor_factory,
+                clock=clock,
+                dry_run=False,
+                repo_root=REPO_ROOT,
+            )
+        finally:
+            for resource in (quotes, broker):
+                close = getattr(resource, "close", None)
+                if callable(close):
+                    close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -203,20 +213,28 @@ def main(argv: list[str] | None = None) -> int:
         if args.list_accounts:
             _print(cli_support.list_accounts())
         else:
+            res = cli_support.run_status(
+                data_dir,
+                check_account=args.check_account,
+                test_order=args.test_order,
+                account_id=args.account_id,
+            )
+            if not (args.check_account or args.test_order):
+                _print(res)
+    elif args.command == "flatten":
+        if args.confirm:
+            with cli_support.acquire_runner_lock(data_dir):
+                _print(
+                    cli_support.run_flatten(
+                        data_dir, confirm=args.confirm, account_id=args.account_id
+                    )
+                )
+        else:
             _print(
-                cli_support.run_status(
-                    data_dir,
-                    check_account=args.check_account,
-                    test_order=args.test_order,
-                    account_id=args.account_id,
+                cli_support.run_flatten(
+                    data_dir, confirm=args.confirm, account_id=args.account_id
                 )
             )
-    elif args.command == "flatten":
-        _print(
-            cli_support.run_flatten(
-                data_dir, confirm=args.confirm, account_id=args.account_id
-            )
-        )
     elif args.command == "dry-run":
         _print(daemon.run(data_dir, dry_run=True, repo_root=REPO_ROOT))
     elif args.command == "daemon":
@@ -236,20 +254,32 @@ def main(argv: list[str] | None = None) -> int:
     elif args.command == "morning":
         _print(_morning(data_dir))
     elif args.command == "reconcile":
-        reg = registration.load_registration(data_dir)
-        broker = cli_support.make_broker(int(reg["account_id"]))
-        try:
-            _print(
-                daemon.reconcile_books(
-                    data_dir, us_clock.today(), broker=broker, reg=reg
+        with cli_support.acquire_runner_lock(data_dir):
+            reg = registration.load_registration(data_dir)
+            broker = cli_support.make_broker(int(reg["account_id"]))
+            try:
+                _print(
+                    daemon.reconcile_books(
+                        data_dir, us_clock.today(), broker=broker, reg=reg
+                    )
                 )
-            )
-        finally:
-            close = getattr(broker, "close", None)
-            if callable(close):
-                close()
+            finally:
+                close = getattr(broker, "close", None)
+                if callable(close):
+                    close()
     elif args.command == "parity":
         _print(_run_parity(data_dir, date.fromisoformat(args.date)))
+    elif args.command == "ack":
+        _print(
+            str(
+                cli_support.run_ack(
+                    data_dir,
+                    short=args.short,
+                    through=date.fromisoformat(args.through),
+                    note=args.note,
+                )
+            )
+        )
     elif args.command == "stop":
         _print(str(cli_support.run_stop(data_dir, reason=args.reason)))
     elif args.command == "report":

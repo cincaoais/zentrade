@@ -97,6 +97,11 @@ def statuses_on(data_dir: Path, short: str, d: date) -> dict[str, str]:
     }
 
 
+def rows_for(data_dir: Path, short: str) -> list[dict]:
+    """Every recorded ``{date, short, status, reason}`` row of one strategy."""
+    return [row for row in _read_rows(_path(data_dir)) if row.get("short") == short]
+
+
 def missing_days(data_dir: Path, short: str, start: date, end: date) -> list[date]:
     """Trading days in ``[start, end]`` with no record for ``short``."""
     recorded = {

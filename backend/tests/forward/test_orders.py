@@ -198,3 +198,187 @@ def test_order_missing_until_deadline_is_unknown(tmp_path: Path) -> None:
 
     assert result[key]["status"] == "unknown"
     assert journal.state(key) == "unknown"
+
+
+# ── review fixes (2026-11-19) ───────────────────────────────────
+
+
+def _filled(order: dict, qty: int | None = None) -> None:
+    order["order_status"] = "FILLED_ALL"
+    order["dealt_qty"] = int(qty if qty is not None else order["qty"])
+    order["dealt_avg_price"] = 101.0
+
+
+def test_failed_cancel_rereads_the_fill(tmp_path: Path) -> None:
+    # The order fills between the last poll and the cancel: the cancel fails,
+    # and the fill must still reach the journal (and therefore the book).
+    from app.forward.book import LiveBook
+
+    journal, executor, ctx, clock = _setup(tmp_path)
+
+    def fill_then_refuse(order: dict):
+        _filled(order)
+        return 1, "order already filled"
+
+    ctx.on_cancel = fill_then_refuse
+    key = _key("AAPL", "B")
+    executor.submit(key, "AAPL", "B", 50)
+
+    result = executor.poll_until(clock.monotonic())
+
+    assert result[key]["status"] == "filled"
+    assert journal.state(key) == "filled"
+    book = LiveBook.from_journal("h2s", 1_000_000.0, journal.events())
+    assert book.lots["AAPL"].shares == 50
+
+
+def test_cancelled_remainder_uses_dealt_after_cancel(tmp_path: Path) -> None:
+    _journal, executor, ctx, clock = _setup(tmp_path, partial_fill_qty=40)
+    ctx.positions = {"AAPL": 100}
+
+    def more_fills_then_cancel(order: dict):
+        order["dealt_qty"] = 70
+        return None
+
+    ctx.on_cancel = more_fills_then_cancel
+    key = _key("AAPL", "S")
+    executor.submit(key, "AAPL", "S", 100)
+
+    executor.poll_until(clock.monotonic())
+
+    retry = ctx.calls_named("place_order")[1]["kwargs"]
+    assert retry["remark"] == f"{key}-r1"
+    assert retry["qty"] == 30
+
+
+def test_unknown_key_resolved_when_order_appears(tmp_path: Path) -> None:
+    journal, executor, ctx, clock = _setup(
+        tmp_path, accept_then_raise=RuntimeError("socket"), drop_orders=True
+    )
+    key = _key("AAPL", "B")
+    assert executor.submit(key, "AAPL", "B", 10) == "unknown"
+
+    # The list catches up later: the order was accepted and filled.
+    ctx.orders.append(
+        {
+            "order_id": "ORD9",
+            "code": "US.AAPL",
+            "remark": key,
+            "order_status": "FILLED_ALL",
+            "qty": 10,
+            "dealt_qty": 10,
+            "dealt_avg_price": 99.0,
+            "trd_side": "BUY",
+        }
+    )
+    executor.poll_until(clock.monotonic() + 5)
+
+    assert journal.state(key) == "filled"
+    assert len(ctx.calls_named("place_order")) == 1
+
+
+def test_sell_capped_at_broker_position(tmp_path: Path) -> None:
+    journal, executor, ctx, _ = _setup(tmp_path)
+    ctx.positions = {"AAPL": 30}
+    key = _key("AAPL", "S")
+
+    executor.submit(key, "AAPL", "S", 100)
+
+    placed = ctx.calls_named("place_order")
+    assert [call["kwargs"]["qty"] for call in placed] == [30]
+    submitting = [e for e in journal.events() if e.get("state") == "submitting"]
+    assert submitting[0]["qty"] == 30
+    assert submitting[0]["capped_from"] == 100
+
+
+def test_sell_skipped_when_broker_holds_none(tmp_path: Path) -> None:
+    journal, executor, ctx, _ = _setup(tmp_path)
+    ctx.positions = {}
+    key = _key("AAPL", "S")
+
+    assert executor.submit(key, "AAPL", "S", 100) == "skipped"
+    assert executor.submit(key, "AAPL", "S", 100) == "skipped"
+    assert not ctx.calls_named("place_order")
+    assert journal.state(key) == "skipped"
+
+
+def test_second_sell_cap_counts_pending_sell(tmp_path: Path) -> None:
+    # Two strategies selling the same symbol from one account: the second sell
+    # may only take what the first has not already claimed.
+    _, executor, ctx, _ = _setup(tmp_path)
+    ctx.positions = {"AAPL": 100}
+
+    executor.submit(_key("AAPL", "S", "h2s"), "AAPL", "S", 80)
+    executor.submit(_key("AAPL", "S", "h6h43b"), "AAPL", "S", 80)
+
+    assert [c["kwargs"]["qty"] for c in ctx.calls_named("place_order")] == [80, 20]
+
+
+def test_refresh_applies_fills_without_cancelling(tmp_path: Path) -> None:
+    journal, executor, ctx, _ = _setup(tmp_path)
+    key = _key("AAPL", "B")
+    executor.submit(key, "AAPL", "B", 10)
+
+    assert executor.refresh() == {key: "submitted"}
+    _filled(ctx.orders[0])
+    assert executor.refresh() == {key: "filled"}
+    assert journal.state(key) == "filled"
+    assert not ctx.calls_named("modify_order")
+
+
+def test_resolve_stale_reads_order_history(tmp_path: Path) -> None:
+    from datetime import date
+
+    journal, executor, ctx, _ = _setup(tmp_path)
+    old = "fw-h2s-20261117-AAPL-S"
+    journal.append({"key": old, "state": "submitting", "symbol": "AAPL", "side": "S", "qty": 50})
+    journal.append({"key": old, "state": "submitted", "order_id": "OLD1", "symbol": "AAPL", "side": "S", "qty": 50})
+    ctx.history = [
+        {
+            "order_id": "OLD1",
+            "code": "US.AAPL",
+            "remark": old,
+            "order_status": "FILLED_ALL",
+            "qty": 50,
+            "dealt_qty": 50,
+            "dealt_avg_price": 120.0,
+            "trd_side": "SELL",
+        }
+    ]
+
+    resolved = executor.resolve_stale(date(2026, 11, 18))
+
+    assert resolved == {old: "filled"}
+    assert journal.state(old) == "filled"
+    call = ctx.calls_named("history_order_list_query")[0]["kwargs"]
+    assert call["start"] == "2026-11-17"
+    assert call["end"] == "2026-11-17"
+
+
+def test_resolve_stale_leaves_todays_keys_alone(tmp_path: Path) -> None:
+    from datetime import date
+
+    _journal, executor, ctx, _ = _setup(tmp_path)
+    executor.submit(_key("AAPL", "B"), "AAPL", "B", 10)
+
+    assert executor.resolve_stale(date(2026, 11, 18)) == {}
+    assert not ctx.calls_named("history_order_list_query")
+
+
+def test_cancelling_status_is_not_final() -> None:
+    from app.forward.orders import _state
+
+    assert _state({"status": "CANCELLING_ALL"}) == "submitted"
+    assert _state({"status": "CANCELLING_PART"}) == "partial"
+    assert _state({"status": "FILL_CANCELLED"}) == "cancelled"
+
+
+def test_torn_last_journal_line_is_ignored(tmp_path: Path) -> None:
+    path = tmp_path / "orders.jsonl"
+    path.write_text('{"key": "k", "state": "submitting"}\n{"key": "k", "sta', encoding="utf-8")
+
+    assert [e["state"] for e in Journal(path).events()] == ["submitting"]
+
+    path.write_text('{"key": "k", "sta\n{"key": "k", "state": "submitting"}\n', encoding="utf-8")
+    with pytest.raises(ValueError):
+        Journal(path).events()

@@ -9,7 +9,11 @@ it is skipped and reported with ``reason="no_engine_entry_price"``.
 
 Quotes older than ``STALE_QUOTE_S`` are ignored and logged. Each lot is sold at
 most once per trading day (the order key is deterministic and the executor is
-idempotent as well).
+idempotent as well). Sent stop orders are read back every tick and once more at
+the end of the session, so their fills reach the order journal and the next
+day's book. The kill flag (``forward/STOP``) blocks new stop orders (spec 6.8:
+checked before every order). One failed tick is logged in ``errors`` and the
+watch carries on.
 """
 
 from __future__ import annotations
@@ -19,6 +23,7 @@ import math
 import time
 from collections.abc import Iterable, Mapping
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
 
 from app.forward.book import LiveBook
@@ -75,6 +80,7 @@ class StopWatch:
         clock: Any,
         poll_s: float = 5.0,
         dry_run: bool = False,
+        stop_flag: Path | None = None,
     ) -> None:
         if isinstance(books, Mapping):
             self.books: list[LiveBook] = list(books.values())
@@ -91,6 +97,25 @@ class StopWatch:
         self.dry_run = bool(dry_run)
         self._sold: dict[date, set[str]] = {}
         self._skipped: dict[date, set[tuple[str, str]]] = {}
+        self.stop_flag = Path(stop_flag) if stop_flag is not None else None
+        self._flagged: set[date] = set()
+        # Stop keys sent and not yet final: key -> (book short, symbol).
+        self._pending: dict[str, tuple[str, str]] = {}
+        self.errors: list[str] = []
+
+    # ── sent stop orders ─────────────────────────────────────
+    def settle(self) -> None:
+        """Read sent stop orders back; drop the lot of a filled one from its book."""
+        if not self._pending:
+            return
+        states = self.executor.refresh(keys=list(self._pending))
+        for key, state in states.items():
+            if state in {"filled", "cancelled", "failed", "skipped"}:
+                short, symbol = self._pending.pop(key)
+                if state == "filled":
+                    for book in self.books:
+                        if book.short == short:
+                            book.lots.pop(symbol, None)
 
     # ── per-tick decision ────────────────────────────────────
     def tick(self, now: datetime) -> list[dict[str, Any]]:
@@ -99,6 +124,8 @@ class StopWatch:
         epoch = now.timestamp()
         sold_today = self._sold.setdefault(day, set())
         skipped_today = self._skipped.setdefault(day, set())
+        if not self.dry_run:
+            self.settle()
 
         symbols: list[str] = []
         for book in self.books:
@@ -158,6 +185,15 @@ class StopWatch:
                 if shares <= 0:
                     continue
 
+                if self.stop_flag is not None and self.stop_flag.exists():
+                    if day not in self._flagged:
+                        self._flagged.add(day)
+                        logger.warning("%s %s 触及止损但存在停止标志, 不下单", book.short, symbol)
+                        records.append(
+                            {"symbol": symbol, "short": book.short, "key": key, "reason": "kill_flag"}
+                        )
+                    continue
+
                 if self.dry_run:
                     logger.warning(
                         "%s %s 试运行: 将卖出 %d 股 @市价 (止损 %.4f, 最新 %.4f)",
@@ -181,7 +217,7 @@ class StopWatch:
                     continue
 
                 try:
-                    self.executor.submit(key, symbol, "S", shares)
+                    outcome = self.executor.submit(key, symbol, "S", shares)
                 except Exception as exc:  # one lot must not stop the watch
                     logger.warning("%s %s 止损下单失败: %s", book.short, symbol, exc)
                     records.append(
@@ -195,6 +231,13 @@ class StopWatch:
                     continue
 
                 sold_today.add(key)
+                if outcome == "skipped":
+                    logger.warning("%s %s 触及止损但券商没有可卖股数", book.short, symbol)
+                    records.append(
+                        {"symbol": symbol, "short": book.short, "key": key, "reason": "broker_holds_none"}
+                    )
+                    continue
+                self._pending[key] = (book.short, symbol)
                 records.append(
                     {
                         "symbol": symbol,
@@ -215,14 +258,28 @@ class StopWatch:
             time.sleep(seconds)
 
     def run_until(self, end_time: datetime) -> None:
-        """Tick every ``poll_s`` until the clock reaches ``end_time``."""
+        """Tick every ``poll_s`` until the clock reaches ``end_time``.
+
+        A failed tick (quote or broker error) is logged and kept in ``errors``;
+        the watch goes on. Sent stop orders are read back once more at the end.
+        """
         while True:
             now = self.clock.now()
             if now >= end_time:
-                return
-            self.tick(now)
-            remaining = (end_time - now).total_seconds()
+                break
+            try:
+                self.tick(now)
+            except Exception as exc:  # one bad tick must not end the day's stops
+                logger.exception("止损轮询失败")
+                self.errors.append(f"{now.isoformat()} {type(exc).__name__}: {exc}")
+            remaining = end_time.timestamp() - now.timestamp()
             self._sleep(max(0.0, min(self.poll_s, remaining)))
+        if not self.dry_run:
+            try:
+                self.settle()
+            except Exception as exc:
+                logger.exception("收盘读取止损单失败")
+                self.errors.append(f"settle {type(exc).__name__}: {exc}")
 
 
 __all__ = ["STALE_QUOTE_S", "STOP_FRACTION", "StopWatch", "stop_line"]

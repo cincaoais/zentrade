@@ -227,3 +227,92 @@ def test_missing_engine_price_recorded_once_per_day(tmp_path: Path) -> None:
     second = watch.tick(NOW + timedelta(seconds=5))
     assert [r["reason"] for r in first] == ["no_engine_entry_price"]
     assert second == []
+
+
+# ── review fixes (2026-11-19) ───────────────────────────────────
+
+
+def test_stop_fill_reaches_the_journal(tmp_path: Path) -> None:
+    # Regression: a stop sell was never polled, so the book kept the lot and
+    # the stop fired again the next day.
+    from app.forward.book import LiveBook as _LiveBook
+
+    watch, _quotes, ctx, _clock, journal = _setup(tmp_path, {"AAPL": _snapshot(84.0)})
+    journal.append(
+        {"key": "fw-h2s-20261117-AAPL-B", "state": "filled", "symbol": "AAPL",
+         "side": "B", "qty": 100, "dealt_qty": 100, "dealt_avg_price": 100.0}
+    )
+    watch.tick(NOW)
+    key = "fw-h2s-20261118-AAPL-S-stop"
+    order = next(o for o in ctx.orders if o["remark"] == key)
+    order.update(order_status="FILLED_ALL", dealt_qty=100, dealt_avg_price=84.0)
+
+    watch.tick(NOW + timedelta(seconds=5))
+
+    assert journal.state(key) == "filled"
+    next_day = _LiveBook.from_journal("h2s", 1_000_000.0, journal.events())
+    assert "AAPL" not in next_day.lots
+    assert "AAPL" not in watch.books[0].lots
+
+
+def test_run_until_settles_stop_orders_at_the_end(tmp_path: Path) -> None:
+    clock = _Clock(NOW)
+    watch, _quotes, ctx, _clock, journal = _setup(
+        tmp_path, {"AAPL": _snapshot(80.0)}, clock=clock
+    )
+
+    def fill_on_query(*args, **kwargs):
+        ctx._record("order_list_query", args, kwargs, trade=True)
+        for order in ctx.orders:
+            order.update(order_status="FILLED_ALL", dealt_qty=order["qty"], dealt_avg_price=80.0)
+        return 0, [dict(order) for order in ctx.orders]
+
+    ctx.order_list_query = fill_on_query
+    watch.run_until(NOW + timedelta(seconds=1))
+
+    assert journal.state("fw-h2s-20261118-AAPL-S-stop") == "filled"
+
+
+def test_tick_error_does_not_end_the_watch(tmp_path: Path) -> None:
+    clock = _Clock(NOW)
+    watch, quotes, ctx, _clock, _journal = _setup(
+        tmp_path, {"AAPL": _snapshot(80.0)}, clock=clock
+    )
+    real = quotes.snapshot
+    calls = {"n": 0}
+
+    def flaky(symbols):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("quote socket closed")
+        return {s: {**real(symbols)[s], "update_time": clock.now().timestamp()} for s in symbols}
+
+    quotes.snapshot = flaky
+    watch.run_until(NOW + timedelta(seconds=12))
+
+    assert len(watch.errors) == 1
+    assert "quote socket closed" in watch.errors[0]
+    assert len(ctx.calls_named("place_order")) == 1
+
+
+def test_kill_flag_blocks_stop_orders(tmp_path: Path) -> None:
+    flag = tmp_path / "STOP"
+    flag.write_text("stopped", encoding="utf-8")
+    watch, _quotes, ctx, _clock, _journal = _setup(tmp_path, {"AAPL": _snapshot(80.0)})
+    watch.stop_flag = flag
+
+    records = watch.tick(NOW)
+
+    assert ctx.calls_named("place_order") == []
+    assert [r["reason"] for r in records] == ["kill_flag"]
+    assert watch.tick(NOW + timedelta(seconds=5)) == []
+
+
+def test_stop_skipped_when_broker_holds_nothing(tmp_path: Path) -> None:
+    watch, _quotes, ctx, _clock, _journal = _setup(tmp_path, {"AAPL": _snapshot(80.0)})
+    ctx.positions = {}
+
+    records = watch.tick(NOW)
+
+    assert ctx.calls_named("place_order") == []
+    assert [r.get("reason") for r in records] == ["broker_holds_none"]

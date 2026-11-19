@@ -104,6 +104,25 @@ def _unpack(response: Any, what: str) -> list[dict[str, Any]]:
     return _rows(data)
 
 
+def _order_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """One SDK order row in the forward runner's shape."""
+    code = str(row.get("code") or "")
+    try:
+        symbol = from_moomoo(code)
+    except ValueError:
+        symbol = code
+    return {
+        "order_id": str(row.get("order_id", "")),
+        "code": symbol,
+        "remark": str(row.get("remark") or ""),
+        "status": str(row.get("order_status") or row.get("status") or "").upper(),
+        "qty": _integer(row.get("qty")),
+        "dealt_qty": _integer(row.get("dealt_qty")),
+        "dealt_avg_price": _number(row.get("dealt_avg_price")),
+        "trd_side": str(row.get("trd_side") or "").upper(),
+    }
+
+
 def _default_trade_context() -> Any:
     host, port = opend_address()
     return OpenSecTradeContext(filter_trdmarket=TrdMarket.US, host=host, port=port)
@@ -221,29 +240,16 @@ class SimBroker:
         return str(order_id)
 
     def orders_today(self) -> list[dict[str, Any]]:
-        rows = self._call(self._context().order_list_query)
-        orders: list[dict[str, Any]] = []
-        for row in rows:
-            code = str(row.get("code") or "")
-            try:
-                symbol = from_moomoo(code)
-            except ValueError:
-                symbol = code
-            orders.append(
-                {
-                    "order_id": str(row.get("order_id", "")),
-                    "code": symbol,
-                    "remark": str(row.get("remark") or ""),
-                    "status": str(
-                        row.get("order_status") or row.get("status") or ""
-                    ).upper(),
-                    "qty": _integer(row.get("qty")),
-                    "dealt_qty": _integer(row.get("dealt_qty")),
-                    "dealt_avg_price": _number(row.get("dealt_avg_price")),
-                    "trd_side": str(row.get("trd_side") or "").upper(),
-                }
-            )
-        return orders
+        return [_order_row(row) for row in self._call(self._context().order_list_query)]
+
+    def history_orders(self, start: dt.date, end: dt.date) -> list[dict[str, Any]]:
+        """Orders of earlier days (``order_list_query`` only lists today's)."""
+        rows = self._call(
+            self._context().history_order_list_query,
+            start=start.isoformat(),
+            end=end.isoformat(),
+        )
+        return [_order_row(row) for row in rows]
 
     def cancel(self, order_id: str) -> None:
         self._call(

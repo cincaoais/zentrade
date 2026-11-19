@@ -15,6 +15,8 @@ from datetime import date
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from app.forward.orders import _state as _orders_state
+
 
 def _parse_date(val: Any) -> date:
     if isinstance(val, date):
@@ -33,33 +35,8 @@ class Lot(NamedTuple):
     key: str
 
 
-_ALIASES = {
-    "filled_all": "filled",
-    "filled_part": "partial",
-    "cancelled_all": "cancelled",
-    "cancelled_part": "cancelled",
-    "cancelling_all": "cancelled",
-    "cancelling_part": "cancelled",
-    "deleted": "cancelled",
-    "disabled": "cancelled",
-    "failed": "failed",
-    "submit_failed": "failed",
-    "timeout": "failed",
-    "submitted": "submitted",
-    "waiting_submit": "submitted",
-    "unsubmitted": "submitted",
-    "submitting": "submitting",
-}
-
-
-def _state(event: dict[str, Any]) -> str | None:
-    raw = event.get("state")
-    if raw is None:
-        raw = event.get("status")
-    if raw is None:
-        return None
-    text = str(raw).strip().lower()
-    return _ALIASES.get(text, text)
+# One status vocabulary for the book and the executor.
+_state = _orders_state
 
 
 def _int(value: Any) -> int:
@@ -162,10 +139,10 @@ class LiveBook:
 
         state = _state(event)
         if state == "unknown":
+            # Unresolved, but any quantity already reported as dealt is real.
             self.unknown_orders.append(dict(event))
-            return
 
-        if state not in ("filled", "cancelled", "partial"):
+        if state not in ("filled", "cancelled", "partial", "unknown"):
             return
 
         dealt_qty = _int(event.get("dealt_qty"))
@@ -394,14 +371,22 @@ def reconcile(
     }
 
 
-def save_book(path: Path | str, book: LiveBook) -> Path:
-    """Save LiveBook state to a JSON file atomically."""
+def save_book(
+    path: Path | str, book: LiveBook, *, journal_events: int | None = None
+) -> Path:
+    """Save LiveBook state to a JSON file atomically.
+
+    ``journal_events`` is how many order-journal events the book was rebuilt
+    from, so a later check can rebuild from exactly those events: the journal
+    keeps growing (stop fills) after the book is saved.
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "short": book.short,
         "capital": book.capital,
         "cash": book.cash,
+        "journal_events": journal_events,
         "lots": {
             sym: {
                 "symbol": lot.symbol,
@@ -446,6 +431,15 @@ def load_book(path: Path | str) -> LiveBook:
     )
 
 
+def saved_journal_events(path: Path | str) -> int | None:
+    """The journal length recorded by ``save_book`` (``None`` if absent)."""
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8")).get("journal_events")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return int(value) if isinstance(value, int) else None
+
+
 def check_saved_matches_journal(path: Path | str, book: LiveBook) -> bool:
     """Check that saved book on disk matches the book rebuilt from journal."""
     p = Path(path)
@@ -486,4 +480,5 @@ __all__ = [
     "load_book",
     "reconcile",
     "save_book",
+    "saved_journal_events",
 ]

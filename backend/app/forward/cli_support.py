@@ -13,12 +13,14 @@ import os
 import statistics
 import tempfile
 import time
+from contextlib import contextmanager, suppress
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
 from pathlib import Path
 from typing import Any
 
 import polars as pl
+import psutil
 
 from app.forward import registration
 from app.forward.book import LiveBook
@@ -31,6 +33,7 @@ from app.research.registry import Registry
 
 __all__ = [
     "SystemClock",
+    "acquire_runner_lock",
     "append_audit",
     "audit_path",
     "default_workers",
@@ -42,6 +45,7 @@ __all__ = [
     "place_test_limit",
     "reference_block",
     "report_engine_book_fn",
+    "run_ack",
     "run_flatten",
     "run_register",
     "run_rehearse",
@@ -105,6 +109,64 @@ def append_audit(data_dir: Path, event: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, sort_keys=True, default=str) + "\n")
         handle.flush()
         os.fsync(handle.fileno())
+
+
+# ---------------------------------------------------------------------------
+# Runner lock (single running copy)
+# ---------------------------------------------------------------------------
+
+
+def _write_runner_lock(path: Path) -> None:
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    fd = os.open(path, flags)
+    try:
+        payload = json.dumps(
+            {
+                "pid": os.getpid(),
+                "started": datetime.now(UTC).isoformat(),
+            }
+        )
+        os.write(fd, payload.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def acquire_runner_lock(data_dir: Path):
+    path = forward_dir(Path(data_dir)) / "runner.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    my_pid = os.getpid()
+
+    try:
+        _write_runner_lock(path)
+    except FileExistsError:
+        existing_pid = None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and "pid" in data:
+                existing_pid = int(data["pid"])
+        except Exception:
+            existing_pid = None
+
+        if existing_pid is not None and psutil.pid_exists(existing_pid):
+            raise RuntimeError(
+                f"another forward runner is running (pid {existing_pid}); "
+                f"if that process is not a forward runner, delete {path}"
+            ) from None
+
+        # Stale or unreadable lock: replace it
+        with suppress(OSError):
+            path.unlink(missing_ok=True)
+        _write_runner_lock(path)
+
+    try:
+        yield path
+    finally:
+        with suppress(Exception):
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                if data.get("pid") == my_pid:
+                    path.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -221,90 +283,97 @@ def run_status(
     data_dir = Path(data_dir)
     clock = clock or SystemClock()
     now = clock.now()
+    owned_broker = broker is None
     broker = _resolve_broker(data_dir, broker, account_id, broker_factory)
-    result: dict[str, Any] = {"date": now.date().isoformat()}
+    try:
+        result: dict[str, Any] = {"date": now.date().isoformat()}
 
-    if check_account:
-        account = broker.check_account()
-        cash = broker.cash()
-        positions = broker.positions()
-        orders = broker.orders_today()
-        result.update(
-            {
-                "account": account,
-                "cash": cash,
-                "positions": positions,
-                "orders": orders,
-            }
-        )
-        print(
-            json.dumps(
+        if check_account:
+            account = broker.check_account()
+            cash = broker.cash()
+            positions = broker.positions()
+            orders = broker.orders_today()
+            result.update(
                 {
                     "account": account,
                     "cash": cash,
                     "positions": positions,
                     "orders": orders,
-                },
-                indent=2,
-                sort_keys=True,
-                default=str,
+                }
             )
-        )
-
-    if test_order:
-        symbol = str(test_order).upper()
-        if not is_regular_hours(now, calendar):
-            raise RuntimeError("--test-order only runs during regular US hours")
-        quotes = quotes or make_quotes()
-        snapshot = quotes.snapshot([symbol]).get(symbol) or {}
-        last = snapshot.get("last_price")
-        if last is None or float(last) <= 0:
-            raise BrokerError(f"{symbol} has no usable last price")
-        price = round(float(last) * 0.8, 2)
-        remark = f"fw-test-{now:%Y%m%d}-{symbol}"
-        order_id = place_test_limit(broker, symbol, price, remark)
-
-        orders = broker.orders_today()
-        placed = next(
-            (
-                row
-                for row in orders
-                if str(row.get("remark")) == remark
-                or str(row.get("order_id")) == order_id
-            ),
-            None,
-        )
-        print("placed order:")
-        print(
-            json.dumps(
-                placed or {"order_id": order_id, "remark": remark},
-                indent=2,
-                sort_keys=True,
-                default=str,
+            print(
+                json.dumps(
+                    {
+                        "account": account,
+                        "cash": cash,
+                        "positions": positions,
+                        "orders": orders,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                )
             )
-        )
 
-        cancel_id = str((placed or {}).get("order_id") or order_id)
-        broker.cancel(cancel_id)
-        final = next(
-            (row for row in broker.orders_today() if str(row.get("remark")) == remark),
-            None,
-        )
-        result["test_order"] = {
-            **(placed or {"order_id": order_id, "remark": remark}),
-            "cancelled_status": (final or {}).get("status"),
-        }
-        print("final order:")
-        print(
-            json.dumps(
-                final or {"order_id": cancel_id, "remark": remark},
-                indent=2,
-                sort_keys=True,
-                default=str,
+        if test_order:
+            symbol = str(test_order).upper()
+            if not is_regular_hours(now, calendar):
+                raise RuntimeError("--test-order only runs during regular US hours")
+            quotes = quotes or make_quotes()
+            snapshot = quotes.snapshot([symbol]).get(symbol) or {}
+            last = snapshot.get("last_price")
+            if last is None or float(last) <= 0:
+                raise BrokerError(f"{symbol} has no usable last price")
+            price = round(float(last) * 0.8, 2)
+            remark = f"fw-test-{now:%Y%m%d}-{symbol}"
+            order_id = place_test_limit(broker, symbol, price, remark)
+
+            orders = broker.orders_today()
+            placed = next(
+                (
+                    row
+                    for row in orders
+                    if str(row.get("remark")) == remark
+                    or str(row.get("order_id")) == order_id
+                ),
+                None,
             )
-        )
+            print("placed order:")
+            print(
+                json.dumps(
+                    placed or {"order_id": order_id, "remark": remark},
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                )
+            )
 
-    return result
+            cancel_id = str((placed or {}).get("order_id") or order_id)
+            broker.cancel(cancel_id)
+            final = next(
+                (row for row in broker.orders_today() if str(row.get("remark")) == remark),
+                None,
+            )
+            result["test_order"] = {
+                **(placed or {"order_id": order_id, "remark": remark}),
+                "cancelled_status": (final or {}).get("status"),
+            }
+            print("final order:")
+            print(
+                json.dumps(
+                    final or {"order_id": cancel_id, "remark": remark},
+                    indent=2,
+                    sort_keys=True,
+                    default=str,
+                )
+            )
+
+        return result
+    finally:
+        if owned_broker:
+            close = getattr(broker, "close", None)
+            if callable(close):
+                close()
 
 
 # ---------------------------------------------------------------------------
@@ -325,65 +394,104 @@ def run_flatten(
     """List holdings; with ``--confirm`` cancel and sell everything at market."""
     data_dir = Path(data_dir)
     clock = clock or SystemClock()
+    owned_broker = broker is None
     broker = _resolve_broker(data_dir, broker, account_id, broker_factory)
-    positions = broker.positions()
-    orders = broker.orders_today()
-    print("positions:")
-    print(json.dumps(positions, indent=2, sort_keys=True, default=str))
-    print("open orders:")
-    print(json.dumps(orders, indent=2, sort_keys=True, default=str))
+    try:
+        positions = broker.positions()
+        orders = broker.orders_today()
+        print("positions:")
+        print(json.dumps(positions, indent=2, sort_keys=True, default=str))
+        print("open orders:")
+        print(json.dumps(orders, indent=2, sort_keys=True, default=str))
 
-    result: dict[str, Any] = {
-        "confirmed": bool(confirm),
-        "positions": positions,
-        "orders": orders,
-    }
-    if not confirm:
-        return result
-
-    if not is_regular_hours(clock.now(), calendar):
-        raise RuntimeError("flatten --confirm only runs during regular US hours")
-
-    for order in orders:
-        if _is_open_order(order.get("status")):
-            broker.cancel(str(order.get("order_id")))
-
-    journal = Journal(forward_dir(data_dir) / "flatten" / "orders.jsonl")
-    executor = Executor(broker, journal, clock=clock)
-    day = clock.now().date()
-    keys: list[str] = []
-    errors: list[str] = []
-    for symbol, qty in sorted(positions.items()):
-        shares = int(qty)
-        if shares <= 0:
-            continue
-        key = f"fw-flatten-{day:%Y%m%d}-{symbol}"
-        try:
-            executor.submit(key, symbol, "S", shares)
-        except Exception as exc:  # one symbol must not hide the others
-            errors.append(f"{symbol}: {exc}")
-            continue
-        keys.append(key)
-
-    if keys:
-        executor.poll_until(clock.monotonic() + 600.0)
-
-    final_positions = broker.positions()
-    print("positions after flatten:")
-    print(json.dumps(final_positions, indent=2, sort_keys=True, default=str))
-    result.update(
-        {
-            "keys": keys,
-            "errors": errors,
-            "final_positions": final_positions,
+        result: dict[str, Any] = {
+            "confirmed": bool(confirm),
+            "positions": positions,
+            "orders": orders,
         }
-    )
-    return result
+        if not confirm:
+            return result
+
+        if not is_regular_hours(clock.now(), calendar):
+            raise RuntimeError("flatten --confirm only runs during regular US hours")
+
+        for order in orders:
+            if _is_open_order(order.get("status")):
+                broker.cancel(str(order.get("order_id")))
+
+        journal = Journal(forward_dir(data_dir) / "flatten" / "orders.jsonl")
+        executor = Executor(broker, journal, clock=clock)
+        day = clock.now().date()
+        keys: list[str] = []
+        errors: list[str] = []
+        for symbol, qty in sorted(positions.items()):
+            shares = int(qty)
+            if shares <= 0:
+                continue
+            key = f"fw-flatten-{day:%Y%m%d}-{symbol}"
+            try:
+                executor.submit(key, symbol, "S", shares)
+            except Exception as exc:  # one symbol must not hide the others
+                errors.append(f"{symbol}: {exc}")
+                continue
+            keys.append(key)
+
+        if keys:
+            executor.poll_until(clock.monotonic() + 600.0)
+
+        final_positions = broker.positions()
+        print("positions after flatten:")
+        print(json.dumps(final_positions, indent=2, sort_keys=True, default=str))
+        result.update(
+            {
+                "keys": keys,
+                "errors": errors,
+                "final_positions": final_positions,
+            }
+        )
+        return result
+    finally:
+        if owned_broker:
+            close = getattr(broker, "close", None)
+            if callable(close):
+                close()
 
 
 # ---------------------------------------------------------------------------
 # Kill flag
 # ---------------------------------------------------------------------------
+
+
+def run_ack(
+    data_dir: Path,
+    *,
+    short: str,
+    through: date,
+    note: str = "",
+    clock: Any | None = None,
+) -> Path:
+    """Acknowledge logic/replay mismatches recorded on or before ``through``.
+
+    Entries of ``short`` stay off after such a mismatch until this is run
+    (``morning._entry_hold``).
+    """
+    if short not in LEADS.values():
+        raise ValueError(f"unknown strategy {short!r}; expected one of {sorted(LEADS.values())}")
+    path = forward_dir(Path(data_dir)) / short / "ack.txt"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(through.isoformat() + "\n", encoding="utf-8")
+    now = clock.now() if clock is not None else us_clock.now()
+    append_audit(
+        data_dir,
+        {
+            "event": "ack",
+            "short": short,
+            "through": through.isoformat(),
+            "note": note,
+            "at": now.isoformat(),
+        },
+    )
+    return path
 
 
 def run_stop(data_dir: Path, *, reason: str = "", clock: Any | None = None) -> Path:

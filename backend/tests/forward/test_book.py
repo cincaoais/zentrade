@@ -415,3 +415,29 @@ def test_close_corporate() -> None:
 
     assert "AAPL" not in book.lots
     assert abs(book.cash - 101_000.0) < 1e-4
+
+
+def test_unknown_order_keeps_its_known_fill() -> None:
+    # A cancel that failed after a partial fill ends as unknown: the 40 shares
+    # already dealt are real and must stay in the book.
+    from app.forward.book import LiveBook
+
+    key = "fw-h2s-20261118-AAPL-B"
+    events = [
+        {"key": key, "state": "submitting", "symbol": "AAPL", "side": "B", "qty": 100},
+        {"key": key, "state": "partial", "dealt_qty": 40, "dealt_avg_price": 10.0,
+         "symbol": "AAPL", "trd_side": "BUY"},
+        {"key": key, "state": "unknown", "error": "BrokerError: cancel failed"},
+    ]
+    book = LiveBook.from_journal("h2s", 1_000.0, events)
+
+    assert book.lots["AAPL"].shares == 40
+    assert book.cash == 600.0
+    assert [order["key"] for order in book.unknown_orders] == [key]
+
+
+def test_book_status_aliases_match_executor() -> None:
+    from app.forward import book, orders
+
+    for raw in ("CANCELLING_ALL", "CANCELLING_PART", "FILL_CANCELLED", "FILLED_PART"):
+        assert book._state({"status": raw}) == orders._state({"status": raw})

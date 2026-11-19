@@ -7,7 +7,7 @@ steps, so no OpenD or network is touched and no real data dir is read.
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -130,6 +130,7 @@ def _drive(
     monkeypatch: pytest.MonkeyPatch,
     *,
     morning_error: bool = False,
+    stopwatch: type | None = None,
 ) -> tuple[list[str], dict[str, object]]:
     data = tmp_path / "data"
     data.mkdir()
@@ -142,7 +143,7 @@ def _drive(
     )
     calendar = FakeUSClock()
     monkeypatch.setattr(daemon, "us_clock", calendar)
-    monkeypatch.setattr(daemon, "StopWatch", _fake_stopwatch(order, seen))
+    monkeypatch.setattr(daemon, "StopWatch", stopwatch or _fake_stopwatch(order, seen))
     monkeypatch.setattr(daemon, "engine_entry_prices", lambda data_dir, short: {})
 
     def fake_morning(*args, **kwargs):
@@ -312,3 +313,169 @@ def test_parallel_seed_equals_sequential(tmp_path: Path, monkeypatch) -> None:
     assert signals.load_stored_chan(roots[0], "AAA")[0].equals(
         signals.load_stored_chan(roots[1], "AAA")[0]
     )
+
+
+def test_sleep_until_crosses_spring_forward() -> None:
+    class SpringForwardClock:
+        def __init__(self, start_dt: datetime) -> None:
+            self.tz = start_dt.tzinfo
+            self.start_utc = start_dt.timestamp()
+            self.elapsed = 0.0
+            self.sleeps: list[float] = []
+
+        def now(self) -> datetime:
+            utc_dt = datetime.fromtimestamp(self.start_utc + self.elapsed, tz=UTC)
+            return utc_dt.astimezone(self.tz)
+
+        def sleep(self, s: float) -> None:
+            self.sleeps.append(s)
+            self.elapsed += s
+
+    start = datetime(2027, 3, 12, 19, 0, tzinfo=ET)
+    target = daemon._at(date(2027, 3, 15), daemon.WAKE_BEFORE_OPEN, ET)
+    clock = SpringForwardClock(start)
+
+    daemon._sleep_until(clock, target)
+
+    end_now = clock.now()
+    assert end_now.date() == date(2027, 3, 15)
+    assert end_now.hour == 9
+    assert end_now.minute == 25
+    assert len(clock.sleeps) > 0
+    assert all(s <= 300.0 for s in clock.sleeps)
+
+
+def test_night_retries_until_ready(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_registration(data)
+    calls: list[datetime] = []
+    clock = DaemonClock(
+        datetime(DAY.year, DAY.month, DAY.day, 9, 29, tzinfo=ET),
+        stop_at=datetime(DAY.year, DAY.month, DAY.day, 23, 0, tzinfo=ET),
+    )
+    monkeypatch.setattr(daemon, "us_clock", FakeUSClock())
+    monkeypatch.setattr(daemon, "StopWatch", _fake_stopwatch([], {}))
+    monkeypatch.setattr(daemon, "engine_entry_prices", lambda data_dir, short: {})
+    monkeypatch.setattr(daemon, "run_morning", lambda *a, **kw: {})
+    monkeypatch.setattr(daemon, "reconcile", lambda *a, **kw: {"ok": True})
+
+    def fake_night(data_dir, t, *, repo_root, workers, **kwargs):
+        calls.append(clock.now())
+        if len(calls) < 3:
+            return {"ready": False, "date": t.isoformat()}
+        return {"ready": True, "date": t.isoformat()}
+
+    monkeypatch.setattr(daemon, "run_night", fake_night)
+
+    daemon.run(
+        data,
+        dry_run=False,
+        repo_root=tmp_path / "repo",
+        clock=clock,
+        broker_factory=lambda account_id: FakeBroker(),
+        quotes_factory=lambda: FakeQuotes(),
+    )
+
+    assert len(calls) == 3
+    assert (calls[1] - calls[0]).total_seconds() == 1800.0
+    assert (calls[2] - calls[1]).total_seconds() == 1800.0
+
+
+def test_night_retry_stops_at_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_registration(data)
+    calls: list[datetime] = []
+    clock = DaemonClock(
+        datetime(DAY.year, DAY.month, DAY.day, 9, 29, tzinfo=ET),
+        stop_at=datetime(DAY.year, DAY.month, DAY.day + 1, 8, 0, tzinfo=ET),
+    )
+    monkeypatch.setattr(daemon, "us_clock", FakeUSClock())
+    monkeypatch.setattr(daemon, "StopWatch", _fake_stopwatch([], {}))
+    monkeypatch.setattr(daemon, "engine_entry_prices", lambda data_dir, short: {})
+    monkeypatch.setattr(daemon, "run_morning", lambda *a, **kw: {})
+    monkeypatch.setattr(daemon, "reconcile", lambda *a, **kw: {"ok": True})
+
+    def fake_night(data_dir, t, *, repo_root, workers, **kwargs):
+        calls.append(clock.now())
+        return {"ready": False, "date": t.isoformat()}
+
+    monkeypatch.setattr(daemon, "run_night", fake_night)
+
+    daemon.run(
+        data,
+        dry_run=False,
+        repo_root=tmp_path / "repo",
+        clock=clock,
+        broker_factory=lambda account_id: FakeBroker(),
+        quotes_factory=lambda: FakeQuotes(),
+    )
+
+    deadline = datetime(DAY.year, DAY.month, DAY.day + 1, 7, 0, tzinfo=ET)
+    assert len(calls) > 1
+    assert calls[-1] < deadline
+    assert all(c < deadline for c in calls)
+
+
+
+def test_daemon_refuses_a_non_simulate_account(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.forward.broker import NotSimulate
+
+    data = tmp_path / "data"
+    data.mkdir()
+    _write_registration(data)
+    clock = DaemonClock(
+        datetime(DAY.year, DAY.month, DAY.day, 9, 29, tzinfo=ET),
+        stop_at=datetime(DAY.year, DAY.month, DAY.day, 23, 0, tzinfo=ET),
+    )
+    monkeypatch.setattr(daemon, "us_clock", FakeUSClock())
+    ran: list[str] = []
+    monkeypatch.setattr(daemon, "run_morning", lambda *a, **k: ran.append("morning"))
+
+    class RealAccount(FakeBroker):
+        def check_account(self):
+            raise NotSimulate("account 123456 is REAL")
+
+    with pytest.raises(NotSimulate):
+        daemon.run(
+            data,
+            dry_run=True,
+            repo_root=tmp_path / "repo",
+            clock=clock,
+            broker_factory=lambda account_id: RealAccount(),
+            quotes_factory=lambda: FakeQuotes(),
+        )
+    assert ran == []
+
+
+def test_stop_watch_errors_are_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.forward.days import statuses_on
+
+    seen: dict[str, object] = {}
+
+    class ErroringWatch:
+        def __init__(self, books, quotes, executor, engine_entry_prices, *, clock, **kwargs):
+            self.clock = clock
+            seen["kwargs"] = dict(kwargs)
+            self.errors = ["10:01 RuntimeError: quote socket closed"]
+
+        def run_until(self, end_time: datetime) -> None:
+            remaining = end_time.timestamp() - self.clock.now().timestamp()
+            if remaining > 0:
+                self.clock.sleep(remaining)
+
+    _order, info = _drive(tmp_path, monkeypatch, stopwatch=ErroringWatch)
+
+    data = info["data"]
+    assert seen["kwargs"]["stop_flag"] == data / "forward" / "STOP"
+    for short in LEADS.values():
+        assert "quote socket closed" in statuses_on(data, short, DAY)["stop_missed"]

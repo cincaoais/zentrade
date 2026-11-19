@@ -40,6 +40,8 @@ class FakeTradeContext:
         drop_orders: bool = False,
         remark_limit: int | None = None,
         on_place: Callable[[], None] | None = None,
+        history: list[dict[str, Any]] | None = None,
+        on_cancel: Callable[[dict[str, Any]], tuple[int, Any] | None] | None = None,
     ) -> None:
         self.account_id = account_id
         self.accounts = (
@@ -58,6 +60,8 @@ class FakeTradeContext:
         self.drop_orders = drop_orders
         self.remark_limit = remark_limit
         self.on_place = on_place
+        self.history = list(history or [])
+        self.on_cancel = on_cancel
         self.calls: list[dict[str, Any]] = []
         self._next_order = len(self.orders) + 1
 
@@ -103,6 +107,12 @@ class FakeTradeContext:
         self._record("order_list_query", args, kwargs, trade=True)
         return 0, [dict(order) for order in self.orders]
 
+    def history_order_list_query(
+        self, *args: Any, **kwargs: Any
+    ) -> tuple[int, list[dict[str, Any]]]:
+        self._record("history_order_list_query", args, kwargs, trade=True)
+        return 0, [dict(order) for order in self.history]
+
     def place_order(self, *args: Any, **kwargs: Any) -> tuple[int, list[dict[str, Any]]]:
         self._record("place_order", args, kwargs, trade=True)
         if self.on_place is not None:
@@ -147,6 +157,10 @@ class FakeTradeContext:
         order_id = str(kwargs.get("order_id", args[1] if len(args) > 1 else ""))
         for order in self.orders:
             if str(order["order_id"]) == order_id:
+                if self.on_cancel is not None:
+                    answer = self.on_cancel(order)
+                    if answer is not None:
+                        return answer
                 order["order_status"] = "CANCELLED_ALL"
                 return 0, [dict(order)]
         return 1, f"order {order_id} not found"

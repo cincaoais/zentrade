@@ -343,17 +343,25 @@ class MarketClock:
 
 
 class FakeQuotes:
-    def __init__(self, prices: dict[str, float | None]) -> None:
+    """Snapshots stamped just after T1's open unless ``times`` says otherwise."""
+
+    def __init__(
+        self,
+        prices: dict[str, float | None],
+        times: dict[str, float] | None = None,
+    ) -> None:
         self.prices = prices
+        self.times = dict(times or {})
         self.calls = 0
 
     def snapshot(self, symbols: list[str]) -> dict[str, dict]:
         self.calls += 1
+        fresh = datetime.combine(T1, dt_time(9, 30, 5), tzinfo=ET).timestamp()
         return {
             symbol: {
                 "open_price": self.prices.get(symbol),
                 "last_price": self.prices.get(symbol),
-                "update_time": 0.0,
+                "update_time": self.times.get(symbol, fresh),
             }
             for symbol in symbols
         }
@@ -815,6 +823,7 @@ def test_no_night_record_only_exits(
         ),
     )
     clock, ctx, broker, quotes, factory = _morning_setup(world)
+    ctx.positions = {"S01": 40}
 
     _run_morning(
         world,
@@ -855,6 +864,7 @@ def test_sells_before_buys_and_pacing(
         ),
     )
     clock, ctx, broker, quotes, factory = _morning_setup(world)
+    ctx.positions = {"S01": 40}
 
     _run_morning(
         world,
@@ -1102,3 +1112,187 @@ def test_morning_fallback_eligibility_is_full_universe(
     assert morning_elig.filter(
         (pl.col("symbol") == "S03") & (pl.col("date") == T)
     )["eligible"].to_list() == [True]
+
+
+# ── review fixes (2026-11-19) ───────────────────────────────────
+
+
+def _live(world, clock, ctx, broker, quotes, factory) -> dict:
+    return _run_morning(
+        world,
+        clock=clock,
+        ctx=ctx,
+        broker=broker,
+        quotes=quotes,
+        executor_factory=factory,
+        dry_run=False,
+    )
+
+
+def test_lot_the_engine_no_longer_holds_is_sold(
+    world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A lot left behind by a failed exit, a missed stop or a late morning: the
+    # engine already sold it in its own run, so no action will ever come again.
+    _write_night(world.data, "h2s", relevant=["S00"], candidates=["S00"])
+    _write_night(world.data, "h6h43b")
+    _seed_lot(world.data, "h2s", "S02", 25, _price("S02", 20))
+    _patch_point_loading(monkeypatch, morning)
+    _patch_morning_table(monkeypatch, _table([("S00", T, True, False, 1.0)]))
+    clock, ctx, broker, quotes, factory = _morning_setup(world)
+    ctx.positions = {"S02": 25}
+
+    _live(world, clock, ctx, broker, quotes, factory)
+
+    sells = [c["kwargs"] for c in _order_calls(ctx) if c["kwargs"]["trd_side"] == TrdSide.SELL]
+    assert [(c["code"], c["qty"], c["remark"]) for c in sells] == [
+        ("US.S02", 25, f"fw-h2s-{T1:%Y%m%d}-S02-S")
+    ]
+    assert "catch-up" in statuses_on(world.data, "h2s", T1)["exit_delayed"]
+    decision = _decision(world)
+    assert [a["symbol"] for a in decision["catch_up"]] == ["S02"]
+    assert all(a["symbol"] != "S02" for a in decision["actions"])
+
+
+def test_logic_mismatch_holds_entries_until_acknowledged(
+    world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_night(world.data, "h2s", relevant=["S00"], candidates=["S00"])
+    _write_night(world.data, "h6h43b")
+    record(world.data, "h2s", DAYS[-5], "logic_mismatch", "S03 shares differ")
+    _patch_point_loading(monkeypatch, morning)
+    _patch_morning_table(monkeypatch, _table([("S00", T, True, False, 1.0)]))
+
+    clock, ctx, broker, quotes, factory = _morning_setup(world)
+    _live(world, clock, ctx, broker, quotes, factory)
+    assert _order_calls(ctx) == []
+    assert "logic_mismatch" in statuses_on(world.data, "h2s", T1)["no_plan"]
+
+    ack = world.data / "forward" / "h2s" / "ack.txt"
+    ack.write_text(DAYS[-5].isoformat() + "\n", encoding="utf-8")
+    clock, ctx, broker, quotes, factory = _morning_setup(world)
+    _live(world, clock, ctx, broker, quotes, factory)
+    assert [c["kwargs"]["code"] for c in _order_calls(ctx)] == ["US.S00"]
+
+
+def test_open_from_before_todays_session_is_not_used(
+    world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_night(world.data, "h2s", relevant=["S00"], candidates=["S00"])
+    _write_night(world.data, "h6h43b")
+    _patch_point_loading(monkeypatch, morning)
+    _patch_morning_table(monkeypatch, _table([("S00", T, True, False, 1.0)]))
+    clock, ctx, broker, _quotes, factory = _morning_setup(world)
+    yesterday = datetime.combine(T, dt_time(15, 59), tzinfo=ET).timestamp()
+    quotes = FakeQuotes(_opens(), times={"S00": yesterday})
+
+    _live(world, clock, ctx, broker, quotes, factory)
+
+    assert _order_calls(ctx) == []
+    assert "S00" not in _decision(world)["opens"]
+    assert "no_open" in statuses_on(world.data, "h2s", T1)
+
+
+def test_one_strategy_failing_does_not_stop_the_other(
+    world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_night(world.data, "h2s", relevant=["S00"], candidates=["S00"])
+    _write_night(world.data, "h6h43b", relevant=["S00"], candidates=["S00"])
+    _patch_point_loading(monkeypatch, morning)
+    table = _table([("S00", T, True, False, 1.0)])
+
+    def fake_table(variant_id: str, inputs, elig, bars):
+        if variant_id == "H2-spring":
+            raise RuntimeError("signal table broke")
+        return table, {"kept": 1}
+
+    monkeypatch.setattr(morning, "forward_table", fake_table)
+    clock, ctx, broker, quotes, factory = _morning_setup(world)
+
+    result = _live(world, clock, ctx, broker, quotes, factory)
+
+    assert "signal table broke" in statuses_on(world.data, "h2s", T1)["no_plan"]
+    assert "error" in result["strategies"]["h2s"]
+    assert [c["kwargs"]["remark"] for c in _order_calls(ctx)] == [
+        f"fw-h6h43b-{T1:%Y%m%d}-S00-B"
+    ]
+
+
+def test_both_strategies_send_before_any_polling(
+    world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_night(world.data, "h2s", relevant=["S00"], candidates=["S00"])
+    _write_night(world.data, "h6h43b", relevant=["S00"], candidates=["S00"])
+    _patch_point_loading(monkeypatch, morning)
+    table = _table([("S00", T, True, False, 1.0)])
+    monkeypatch.setattr(morning, "forward_table", lambda *args: (table, {"kept": 1}))
+    clock, ctx, broker, quotes, factory = _morning_setup(world)
+
+    _live(world, clock, ctx, broker, quotes, factory)
+
+    places = [c["time"] for c in ctx.calls_named("place_order")]
+    polls = [c["time"] for c in ctx.calls_named("order_list_query")]
+    assert len(places) == 2
+    assert polls and max(places) <= min(polls)
+
+
+def test_orders_left_open_on_an_earlier_day_are_settled(
+    world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = f"fw-h2s-{T:%Y%m%d}-S03-B"
+    journal = _journal(world.data, "h2s")
+    journal.append({"key": key, "state": "submitting", "symbol": "S03", "side": "B", "qty": 10})
+    journal.append(
+        {"key": key, "state": "submitted", "order_id": "OLD", "symbol": "S03", "side": "B", "qty": 10}
+    )
+    _write_night(world.data, "h2s")
+    _write_night(world.data, "h6h43b")
+    _patch_point_loading(monkeypatch, morning)
+    _patch_morning_table(monkeypatch, _empty_table())
+    clock, ctx, broker, quotes, factory = _morning_setup(world)
+    ctx.history = [
+        {"order_id": "OLD", "code": "US.S03", "remark": key, "order_status": "FILLED_ALL",
+         "qty": 10, "dealt_qty": 10, "dealt_avg_price": 35.0, "trd_side": "BUY"}
+    ]
+
+    _live(world, clock, ctx, broker, quotes, factory)
+
+    assert journal.state(key) == "filled"
+
+
+def test_frozen_symbol_blocks_entry(
+    world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write_night(world.data, "h2s", relevant=["S00"], candidates=["S00"])
+    _write_night(world.data, "h6h43b")
+    rec = world.data / "forward" / "h2s" / "reconcile" / f"{T.isoformat()}.json"
+    rec.parent.mkdir(parents=True, exist_ok=True)
+    rec.write_text(json.dumps({"frozen_symbols": ["S00"]}), encoding="utf-8")
+    _patch_point_loading(monkeypatch, morning)
+    _patch_morning_table(monkeypatch, _table([("S00", T, True, False, 1.0)]))
+    clock, ctx, broker, quotes, factory = _morning_setup(world)
+
+    _live(world, clock, ctx, broker, quotes, factory)
+
+    assert _order_calls(ctx) == []
+    assert "frozen" in statuses_on(world.data, "h2s", T1)["no_plan"]
+
+
+def test_saved_book_is_checked_against_the_journal_at_start(
+    world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.forward.book import LiveBook, save_book
+
+    _write_night(world.data, "h2s")
+    _write_night(world.data, "h6h43b")
+    save_book(
+        world.data / "forward" / "h2s" / "book.json",
+        LiveBook("h2s", 1.0, cash=123.0),
+    )
+    _patch_point_loading(monkeypatch, morning)
+    _patch_morning_table(monkeypatch, _empty_table())
+    clock, ctx, broker, quotes, factory = _morning_setup(world)
+
+    _live(world, clock, ctx, broker, quotes, factory)
+
+    assert "reconcile_mismatch" in statuses_on(world.data, "h2s", T1)

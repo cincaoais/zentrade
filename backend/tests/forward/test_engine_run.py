@@ -475,3 +475,46 @@ def test_relevant_symbols_take_night_candidates_explicitly() -> None:
     assert relevant_symbols(table, DAYS[0], {"HELD"}, ["NEW1", "NEW2"]) == [
         "HELD", "NEW1", "NEW2", "OLD",
     ]
+
+
+# ── review fixes (2026-11-19) ───────────────────────────────────
+
+
+def test_store_falls_back_to_the_runners_saved_bars(tmp_path) -> None:
+    # The daily pipeline may prune a held symbol from the main store after the
+    # runner copied it to forward/bars; the engine must still see it.
+    from app.forward.engine_run import build_engine_store as build
+
+    bars = _all_bars()
+    src = _write_store(tmp_path / "src", bars.filter(pl.col("symbol") != "S01"))
+    saved = bars.filter(pl.col("symbol") == "S01")
+    for key, part in saved.group_by(["date"], maintain_order=True):
+        day = key[0] if isinstance(key, tuple) else key
+        target = src / "forward" / "bars" / f"date={day.isoformat()}"
+        target.mkdir(parents=True, exist_ok=True)
+        part.write_parquet(target / "part.parquet")
+
+    dst = build(src, tmp_path / "dst", SYMBOLS, DAYS[0], DAYS[-1], None)
+    stored = pl.read_parquet(str(dst / "kline_daily_enriched" / "date=*" / "part.parquet"))
+
+    assert stored.filter(pl.col("symbol") == "S01").height == saved.height
+
+
+def test_engine_holdings_after_t1(tmp_path) -> None:
+    from app.forward.engine_run import engine_holdings
+
+    trades = [
+        {"symbol": "A", "entry_date": "2026-01-02", "exit_date": "2026-01-09", "exit_reason": "signal"},
+        {"symbol": "B", "entry_date": "2026-01-02", "exit_date": "2026-01-12", "exit_reason": "end"},
+        {"symbol": "C", "entry_date": "2026-01-02", "exit_date": "2026-01-05", "exit_reason": "stop_loss"},
+        {"symbol": "D", "entry_date": "2026-01-09", "exit_date": "2026-01-12", "exit_reason": "end"},
+        {"symbol": "E", "entry_date": "2026-01-12", "exit_date": "2026-01-12", "exit_reason": "end"},
+    ]
+
+    class Result:
+        pass
+
+    result = Result()
+    result.trades = trades
+    # On 2026-01-09: A sold that day, C sold earlier, B and D (bought today) held.
+    assert engine_holdings(result, date(2026, 1, 9)) == {"B", "D"}
