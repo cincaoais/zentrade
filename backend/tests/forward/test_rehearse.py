@@ -263,7 +263,7 @@ def test_open_exit_overridden_by_intraday_stop_is_classified() -> None:
         {"symbol": "COIN", "date": date(2026, 7, 31), "low_ok": True, "low": 139.11, "stop_price": 139.4}
     ]
 
-    differences, overridden = compare_actions(collected, expected, intraday)
+    differences, overridden, _unclosed = compare_actions(collected, expected, intraday)
 
     assert differences == []
     assert overridden == ["COIN 2026-07-31 open max_hold vs intraday stop_loss"]
@@ -275,7 +275,39 @@ def test_unexplained_extra_sell_is_still_a_difference() -> None:
     from app.forward.rehearse import compare_actions
 
     collected = Counter({("COIN", "2026-07-31", "sell", 715, "max_hold"): 1})
-    differences, overridden = compare_actions(collected, Counter(), [])
+    differences, overridden, _unclosed = compare_actions(collected, Counter(), [])
 
     assert differences == ["unexpected sell COIN 2026-07-31 shares=715 reason=max_hold"]
     assert overridden == []
+
+
+def test_buy_never_closed_by_reference_is_classified() -> None:
+    # Final-year ACA case: the stock stopped trading (2026-10-22) before the end
+    # of the run, the engine could never sell it (stats: pending_exit_positions
+    # = 1), so the reference trade list omits a buy the engine did make.
+    from collections import Counter
+
+    from app.forward.rehearse import compare_actions
+
+    collected = Counter({("ACA", "2026-10-20", "buy", 883, "entry"): 1})
+    differences, overridden, unclosed = compare_actions(
+        collected, Counter(), [], unsellable={"ACA"}, max_unclosed=1
+    )
+
+    assert differences == []
+    assert overridden == []
+    assert unclosed == ["ACA 2026-10-20 bought, never closed (stopped trading)"]
+
+
+def test_unclosed_allowance_is_bounded_by_engine_count() -> None:
+    from collections import Counter
+
+    from app.forward.rehearse import compare_actions
+
+    collected = Counter({("ACA", "2026-10-20", "buy", 883, "entry"): 1})
+    differences, _overridden, unclosed = compare_actions(
+        collected, Counter(), [], unsellable={"ACA"}, max_unclosed=0
+    )
+
+    assert differences == ["unexpected buy ACA 2026-10-20 shares=883 reason=entry"]
+    assert unclosed == []

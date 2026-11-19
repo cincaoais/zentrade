@@ -254,8 +254,17 @@ def compare_actions(
     collected: Counter,
     expected: Counter,
     intraday: list[dict],
-) -> tuple[list[str], list[str]]:
-    """Compare rehearsal actions with the reference; return ``(differences, overridden)``.
+    *,
+    unsellable: set[str] | frozenset[str] = frozenset(),
+    max_unclosed: int = 0,
+) -> tuple[list[str], list[str], list[str]]:
+    """Compare rehearsal actions with the reference.
+
+    Returns ``(differences, overridden, unclosed)``. ``unclosed`` lists buys the
+    engine made in a symbol that stopped trading before the end of the run
+    (``unsellable``): the engine can never sell it, so the position stays open
+    and is missing from the reference trade list. At most ``max_unclosed`` (the
+    engine's ``pending_exit_positions``) buys are explained this way.
 
     ``overridden`` lists open exits (max hold or exit signal) that the morning
     procedure sells at the open while the full-bar engine records an intraday
@@ -264,6 +273,7 @@ def compare_actions(
     """
     differences: list[str] = []
     overridden: list[str] = []
+    unclosed: list[str] = []
     stops = {(row["symbol"], row["date"].isoformat()) for row in intraday}
 
     for row in intraday:
@@ -285,12 +295,15 @@ def compare_actions(
             differences.extend([f"missing {label}"] * (theirs - mine))
             continue
         extra = mine - theirs
+        if kind == "buy" and symbol in unsellable and len(unclosed) < max_unclosed:
+            unclosed.append(f"{symbol} {day} bought, never closed (stopped trading)")
+            extra -= 1
         if kind == "sell" and reason in _OPEN_EXIT_REASONS and (symbol, day) in stops:
             overridden.append(f"{symbol} {day} open {reason} vs intraday stop_loss")
             extra -= 1
         differences.extend([f"unexpected {label}"] * extra)
 
-    return differences, overridden
+    return differences, overridden, unclosed
 
 
 def rehearse(
@@ -429,7 +442,13 @@ def rehearse(
     )
     intraday = [row for row in reference.intraday if row["date"] <= cutoff]
 
-    found, overridden = compare_actions(collected, expected, intraday)
+    last_bar = bars.group_by("symbol").agg(pl.col("date").max().alias("last"))
+    unsellable = set(last_bar.filter(pl.col("last") < end)["symbol"].to_list())
+    stats = _field(reference_result, "stats", {}) or {}
+    max_unclosed = int(stats.get("pending_exit_positions", 0) or 0)
+    found, overridden, unclosed = compare_actions(
+        collected, expected, intraday, unsellable=unsellable, max_unclosed=max_unclosed
+    )
     differences.extend(found)
 
     return {
@@ -439,6 +458,8 @@ def rehearse(
         "differences": differences,
         "intraday_stops": len(intraday),
         "open_exit_vs_intraday_stop": overridden,
+        "bought_never_closed": unclosed,
+        "reference_pending_exit_positions": max_unclosed,
     }
 
 
