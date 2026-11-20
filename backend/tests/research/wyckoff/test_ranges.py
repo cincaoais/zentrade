@@ -258,4 +258,3 @@ def test_b2_event_ranges_truncation_synthetic():
             assert len(cuts) >= 50
             for gate in (False, True):
                 _check_event_ranges_truncation(k, side, gate, cuts)
-

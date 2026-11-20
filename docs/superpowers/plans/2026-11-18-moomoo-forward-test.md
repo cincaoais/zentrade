@@ -130,12 +130,12 @@
 - Consumes: `app.research.hypotheses.VARIANTS`, `Inputs`; `app.research.compose.compose_table`, `with_atr14`; `app.research.ranking.rank_features` (as `scripts/research/compose.py:110-120` does); Task 2 `forward_tradable`; `universe.eligibility`.
 - Produces:
   - `build_inputs(bars: pl.DataFrame, spy: pl.DataFrame, chan: pl.DataFrame, wyk_events: pl.DataFrame, wyk_ranges: pl.DataFrame) -> Inputs` (same construction as `scripts/research/compose.py:108-121`, ATR via `with_atr14`).
-  - `forward_table(variant_id: str, inputs: Inputs, elig: pl.DataFrame, bars: pl.DataFrame) -> tuple[pl.DataFrame, dict]` = `compose_table(VARIANTS[variant_id](inputs), bars, elig)`.
+  - `forward_table(variant_id: str, inputs: Inputs, elig: pl.DataFrame, bars: pl.DataFrame) -> tuple[pl.DataFrame, dict]` = `variant = VARIANTS[variant_id]; compose_table(variant(inputs), bars, elig)`.
   - `forward_eligibility(data_dir, bars: pl.DataFrame, d: date) -> pl.DataFrame` = `universe.eligibility(bars, forward_tradable(data_dir, d), UniverseParams())`.
   - `kept_entry_symbols(table: pl.DataFrame, start: date) -> set[str]` (symbols with `entry` true on or after `start`).
   - `candidates_on(signals_entries: pl.DataFrame, elig: pl.DataFrame, t: date) -> list[str]` (eligible day-t entry symbols before the gap filter).
 
-- [ ] **Step 1: Failing tests:** `test_forward_table_equals_research_table_on_past_data` — on a small fixture (bars + fake points), `forward_table` output equals what `scripts/research/compose.py`'s path produces for the same inputs (call `compose_table(VARIANTS[...](Inputs(...)), ...)` directly in the test); `test_last_day_entry_dropped_without_next_bar` (documents compose's behaviour: day-t entry absent when bars end at t); `test_last_day_entry_kept_with_open_only_bar` (append an open-only bar for t+1 with open > invalidation → entry on t present; with open ≤ invalidation → absent); `test_candidates_on_before_gap_filter`.
+- [ ] **Step 1: Failing tests:** `test_forward_table_equals_research_table_on_past_data` — on a small fixture (bars + fake points), `forward_table` output equals what `scripts/research/compose.py`'s path produces for the same inputs (call `variant = VARIANTS[...]` then `compose_table(variant(Inputs(...)), ...)` directly in the test); `test_last_day_entry_dropped_without_next_bar` (documents compose's behaviour: day-t entry absent when bars end at t); `test_last_day_entry_kept_with_open_only_bar` (append an open-only bar for t+1 with open > invalidation → entry on t present; with open ≤ invalidation → absent); `test_candidates_on_before_gap_filter`.
 - [ ] **Step 2:** Run → FAIL. **Step 3:** Implement. **Step 4:** Pass; ruff.
 - [ ] **Step 5:** Commit `feat(forward): compose forward tables with the frozen variants`.
 

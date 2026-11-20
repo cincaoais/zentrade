@@ -7,6 +7,11 @@ steps, so no OpenD or network is touched and no real data dir is read.
 from __future__ import annotations
 
 import json
+
+# Import the pool module before any test patches multiprocessing.get_context:
+# multiprocessing.pool binds get_context at import time, so a first import
+# while patched would keep the patch for the rest of the session.
+import multiprocessing.pool  # noqa: F401
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -282,7 +287,7 @@ def test_parallel_seed_equals_sequential(tmp_path: Path, monkeypatch) -> None:
     pools: list[str] = []
     real_get_context = signals.mp.get_context
 
-    def recording_get_context(method):
+    def recording_get_context(method=None):
         pools.append(method)
         return real_get_context(method)
 

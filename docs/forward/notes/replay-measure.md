@@ -21,7 +21,7 @@ This document details the Step 1 findings regarding per-day state carried by `re
 
 ### 2.1 Chan Replay (`chan_replay.replay_symbol`)
 
-File: [`backend/app/research/chan_replay.py:139-235`](file:///D:/Desktop/GitHub/zentrade/backend/app/research/chan_replay.py#L139-L235)
+File: [`backend/app/research/chan_replay.py:139-235`](../../../backend/app/research/chan_replay.py#L139-L235)
 
 ```python
 def replay_symbol(
@@ -33,11 +33,11 @@ def replay_symbol(
 ) -> tuple[pl.DataFrame, pl.DataFrame, dict]:
 ```
 
-`replay_symbol` iterates day-by-day across bars starting from `start_index` (`t in range(start_index, len(bars))`, line 159). At each day $t$, it passes the historical slice `bars.iloc[: t + 1]` to `snapshot_fn` (`_real_snapshot`, which wraps `build_level_snapshot` in [`backend/app/research/vendor/dsa_chan/engine.py:511`](file:///D:/Desktop/GitHub/zentrade/backend/app/research/vendor/dsa_chan/engine.py#L511)).
+`replay_symbol` iterates day-by-day across bars starting from `start_index` (`t in range(start_index, len(bars))`, line 159). At each day $t$, it passes the historical slice `bars.iloc[: t + 1]` to `snapshot_fn` (`_real_snapshot`, which wraps `build_level_snapshot` in [`backend/app/research/vendor/dsa_chan/engine.py:511`](../../../backend/app/research/vendor/dsa_chan/engine.py#L511)).
 
 The function carries the following per-day state:
 
-1. **`seen: dict[tuple, dict]`** ([line 153](file:///D:/Desktop/GitHub/zentrade/backend/app/research/chan_replay.py#L153)):
+1. **`seen: dict[tuple, dict]`** ([line 153](../../../backend/app/research/chan_replay.py#L153)):
    - **Key**: Identity tuple `(point.get("type"), point_dt)` where `point_dt = _as_date(point.get("dt"))`.
    - **Value**: The point row dictionary containing:
      - `symbol`: symbol name
@@ -47,23 +47,23 @@ The function carries the following per-day state:
      - `leg_prev_start`, `leg_prev_end`, `leg_last_start`, `leg_last_end`: bi geometry legs extracted via `_legs(point_dt, recent_bis)`
      - `engine_version`
    - **Transitions across days**:
-     - *First observation* ([lines 181-207](file:///D:/Desktop/GitHub/zentrade/backend/app/research/chan_replay.py#L181-L207)): If `identity` is not in `seen`, the row is created and appended to `point_rows`.
-     - *Confirmation update* ([lines 208-209](file:///D:/Desktop/GitHub/zentrade/backend/app/research/chan_replay.py#L208-L209)): If `row["confirmed_date"] is None` and the point's state becomes `"confirmed"` on day $t$, `row["confirmed_date"]` is updated in-place to `current_date`.
+     - *First observation* ([lines 181-207](../../../backend/app/research/chan_replay.py#L181-L207)): If `identity` is not in `seen`, the row is created and appended to `point_rows`.
+     - *Confirmation update* ([lines 208-209](../../../backend/app/research/chan_replay.py#L208-L209)): If `row["confirmed_date"] is None` and the point's state becomes `"confirmed"` on day $t$, `row["confirmed_date"]` is updated in-place to `current_date`.
      - Once confirmed, subsequent observations of the point on later days do not modify the row.
 
-2. **`previous_ids: set[tuple]`** ([line 154](file:///D:/Desktop/GitHub/zentrade/backend/app/research/chan_replay.py#L154)):
+2. **`previous_ids: set[tuple]`** ([line 154](../../../backend/app/research/chan_replay.py#L154)):
    - **Contents**: The set of `(type, point_dt)` identities present in the most recent `available` daily snapshot.
-   - **Vanished / Gone Detection** ([lines 214-226](file:///D:/Desktop/GitHub/zentrade/backend/app/research/chan_replay.py#L214-L226)):
+   - **Vanished / Gone Detection** ([lines 214-226](../../../backend/app/research/chan_replay.py#L214-L226)):
      - Computes `vanished = sorted(previous_ids - current_ids)`.
      - Any point present on day $t-1$ that disappears from day $t$'s snapshot is emitted to `gone_rows` with `gone_date = current_date`, `first_known_date = row["known_date"]`, and `window_start = _earliest_start(recent_bis)`.
-   - **Update** ([line 228](file:///D:/Desktop/GitHub/zentrade/backend/app/research/chan_replay.py#L228)): `previous_ids = current_ids`.
+   - **Update** ([line 228](../../../backend/app/research/chan_replay.py#L228)): `previous_ids = current_ids`.
 
-3. **`stats: dict[str, int]`** ([lines 156, 160-169](file:///D:/Desktop/GitHub/zentrade/backend/app/research/chan_replay.py#L156)):
+3. **`stats: dict[str, int]`** ([lines 156, 160-169](../../../backend/app/research/chan_replay.py#L156)):
    - Tracks `days`, `available_days`, and `error_days`.
 
 4. **Output accumulators**:
-   - `point_rows: list[dict]` ([line 151](file:///D:/Desktop/GitHub/zentrade/backend/app/research/chan_replay.py#L151))
-   - `gone_rows: list[dict]` ([line 152](file:///D:/Desktop/GitHub/zentrade/backend/app/research/chan_replay.py#L152))
+   - `point_rows: list[dict]` ([line 151](../../../backend/app/research/chan_replay.py#L151))
+   - `gone_rows: list[dict]` ([line 152](../../../backend/app/research/chan_replay.py#L152))
 
 #### Feasibility of Incremental Extension for Chan:
 `chan_replay.replay_symbol` does not expose an incremental single-step entrypoint; it hardcodes the full iteration loop and local state initialization. Because `backend/app/research/chan_replay.py` is pinned, `replay_symbol` cannot be modified.
@@ -73,7 +73,7 @@ However, `_real_snapshot` and helper functions can be imported or reimplemented 
 
 ### 2.2 Wyckoff Replay (`wyckoff/replay.wyckoff_symbol`)
 
-File: [`backend/app/research/wyckoff/replay.py:86-164`](file:///D:/Desktop/GitHub/zentrade/backend/app/research/wyckoff/replay.py#L86-L164)
+File: [`backend/app/research/wyckoff/replay.py:86-164`](../../../backend/app/research/wyckoff/replay.py#L86-L164)
 
 ```python
 def wyckoff_symbol(
@@ -82,10 +82,10 @@ def wyckoff_symbol(
 ```
 
 `wyckoff_symbol` does **not** iterate day by day.
-- [Line 95](file:///D:/Desktop/GitHub/zentrade/backend/app/research/wyckoff/replay.py#L95): Converts the entire `bars` series into `candles, kept_dates = us_candles(bars)`.
-- [Lines 102-105](file:///D:/Desktop/GitHub/zentrade/backend/app/research/wyckoff/replay.py#L102-L105): Detects trading ranges across the entire series: `event_ranges` (accumulation and distribution) and `generic_ranges`.
-- [Lines 114-116](file:///D:/Desktop/GitHub/zentrade/backend/app/research/wyckoff/replay.py#L114-L116): Detects events across the entire series: `accumulation_events` and `distribution_events`.
-- [Lines 126, 145](file:///D:/Desktop/GitHub/zentrade/backend/app/research/wyckoff/replay.py#L126): Stamps `known_date = kept_dates[event.known_at]` and `known_date = kept_dates[trading_range.known_at]`.
+- [Line 95](../../../backend/app/research/wyckoff/replay.py#L95): Converts the entire `bars` series into `candles, kept_dates = us_candles(bars)`.
+- [Lines 102-105](../../../backend/app/research/wyckoff/replay.py#L102-L105): Detects trading ranges across the entire series: `event_ranges` (accumulation and distribution) and `generic_ranges`.
+- [Lines 114-116](../../../backend/app/research/wyckoff/replay.py#L114-L116): Detects events across the entire series: `accumulation_events` and `distribution_events`.
+- [Lines 126, 145](../../../backend/app/research/wyckoff/replay.py#L126): Stamps `known_date = kept_dates[event.known_at]` and `known_date = kept_dates[trading_range.known_at]`.
 
 The ported Wyckoff detectors are causal by `known_at` (candle index): running them once on the full candle series produces for each cut exactly the rows a truncated run would produce.
 
