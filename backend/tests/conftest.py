@@ -7,11 +7,34 @@
 """
 from __future__ import annotations
 
+import atexit
+import logging
+import os
+import shutil
+import tempfile
 from pathlib import Path
 
-import pytest
+# Keep the whole suite off the real data/ folder. Without this, settings.data_dir
+# defaults to <repo>/data, and a local run rewrote real kline_daily_enriched
+# partitions, job_store and preferences, and appended to the real backend.log.
+# This must run before anything imports app.config (settings are built at import),
+# and it also reaches subprocess-based tests through the inherited environment.
+_TEST_DATA_DIR = Path(tempfile.mkdtemp(prefix="zentrade-test-data-"))
+os.environ["DATA_DIR"] = str(_TEST_DATA_DIR)
 
-from app.market_clock import us_clock
+
+def _remove_test_data_dir() -> None:
+    # The app's log handler keeps <DATA_DIR>/backend.log open, and Windows will not
+    # delete an open file, so close logging before removing the folder.
+    logging.shutdown()
+    shutil.rmtree(_TEST_DATA_DIR, ignore_errors=True)
+
+
+atexit.register(_remove_test_data_dir)
+
+import pytest  # noqa: E402
+
+from app.market_clock import us_clock  # noqa: E402
 
 _CONFIG_DIR = Path(__file__).resolve().parents[1] / "config"
 _BUILTIN_DIR = Path(__file__).resolve().parents[1] / "app" / "strategy" / "builtin"
@@ -27,6 +50,18 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if item.get_closest_marker("full_edition"):
             item.add_marker(skip)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _require_isolated_data_dir():
+    from app.config import settings
+
+    if Path(settings.data_dir).resolve() != _TEST_DATA_DIR.resolve():
+        pytest.exit(
+            f"tests would use {settings.data_dir}, not the temp data dir; "
+            "app.config was imported before tests/conftest.py set DATA_DIR",
+            returncode=3,
+        )
 
 
 @pytest.fixture(autouse=True, scope="session")
