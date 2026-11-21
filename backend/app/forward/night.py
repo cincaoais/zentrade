@@ -297,22 +297,24 @@ def run_night(
     pins = dict(reg.get("pins") or {})
     start = date.fromisoformat(str(reg["start_date"])[:10])
 
-    snapshot_universe(data_dir, t)
     books = _held_books(data_dir, reg)
     held_by_short = {short: sorted(book.lots) for short, book in books.items()}
     all_held = sorted({symbol for lots in held_by_short.values() for symbol in lots})
     preserve_bars(data_dir, all_held, t)
+    required = sorted(set(all_held) | {"SPY"})
 
-    bars = load_forward_bars(data_dir, end=t)
-    elig = forward_eligibility(data_dir, bars, t)
-    _save_eligibility(data_dir, t, elig)
-    eligible = _eligible_symbols(elig, t)
-    readiness = check_readiness(
-        data_dir,
-        t,
-        sorted(set(all_held) | {"SPY"}),
-        eligible,
-    )
+    # The universe snapshot is write-once, so take it only once day-t bars exist.
+    # Taken earlier, it can freeze a stale symbol list: a late daily pipeline
+    # re-syncs instruments before it writes the bars, and every retry would then
+    # fail with FileExistsError (2026-11-20).
+    readiness = check_readiness(data_dir, t, required, [])
+    if readiness.ready:
+        snapshot_universe(data_dir, t)
+        bars = load_forward_bars(data_dir, end=t)
+        elig = forward_eligibility(data_dir, bars, t)
+        _save_eligibility(data_dir, t, elig)
+        eligible = _eligible_symbols(elig, t)
+        readiness = check_readiness(data_dir, t, required, eligible)
 
     if not readiness.ready:
         reason = (

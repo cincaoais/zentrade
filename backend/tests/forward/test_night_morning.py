@@ -472,6 +472,64 @@ def test_night_writes_relevant_symbols_with_candidates(
     assert (world.data / "forward" / "h2s" / "parity" / f"{T.isoformat()}.json").exists()
 
 
+def test_night_without_day_bars_saves_no_universe_snapshot(
+    world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """2026-11-20: the first not-ready night saved the write-once snapshot from a stale
+    symbol list; the late pipeline then re-synced instruments, and every retry hit
+    FileExistsError. The snapshot must wait until day-t bars exist."""
+    day_dir = world.data / "kline_daily_enriched" / f"date={T.isoformat()}"
+    day_bars = pl.read_parquet(day_dir / "part.parquet")
+    for path in day_dir.iterdir():
+        path.unlink()
+    day_dir.rmdir()
+    snapshot = world.data / "forward" / "universe" / f"{T.isoformat()}.parquet"
+    snapshot.unlink()
+
+    first = run_night(world.data, T, repo_root=world.repo)
+
+    assert first["ready"] is False
+    assert "SPY" in first["reason"]
+    assert not snapshot.exists()
+
+    # The late pipeline re-syncs instruments (S03 drops out), then writes day-t bars.
+    instruments = world.data / "instruments" / "instruments.parquet"
+    pl.read_parquet(instruments).filter(pl.col("symbol") != "S03").write_parquet(instruments)
+    day_dir.mkdir(parents=True)
+    day_bars.write_parquet(day_dir / "part.parquet")
+
+    monkeypatch.setattr(
+        night,
+        "extend_points",
+        lambda *args, **kwargs: {"extended": [], "replayed": [], "failed": []},
+    )
+    _patch_point_loading(monkeypatch, night)
+    monkeypatch.setattr(night, "candidates_on", lambda entries, elig, t: [])
+    monkeypatch.setattr(
+        night,
+        "forward_table",
+        lambda variant, inputs, elig, bars: (_empty_table(), {"kept": 0}),
+    )
+    monkeypatch.setattr(
+        night,
+        "VARIANTS",
+        {
+            "H2-spring": lambda inputs: SimpleNamespace(entries=pl.DataFrame()),
+            "H6-H4-3B": lambda inputs: SimpleNamespace(entries=pl.DataFrame()),
+        },
+    )
+
+    second = run_night(
+        world.data,
+        T,
+        repo_root=world.repo,
+        snapshot_fn=lambda frame: {"status": "available"},
+    )
+
+    assert second["ready"] is True
+    assert pl.read_parquet(snapshot)["symbol"].to_list() == ["S00", "S01", "S02", "SPY"]
+
+
 def test_night_degrades_a_no_plan_day(
     world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
 ) -> None:
