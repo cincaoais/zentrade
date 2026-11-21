@@ -1,0 +1,7 @@
+# Keep every default gitleaks rule; only exempt forward-test order keys.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Forward-test order idempotency keys (fw-<strategy>-<YYYYMMDD>-<SYMBOL>-<side>[-stop]), not secrets"
+regexes = ['''^fw-[a-z0-9]+-\d{8}-[A-Z][A-Z0-9.]*-[BS](-stop)?$''']
